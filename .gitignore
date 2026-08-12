@@ -1,0 +1,5 @@
+/target
+/live
+/config.yaml
+/docs/old
+.DS_Store
