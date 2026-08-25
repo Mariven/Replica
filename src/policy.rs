@@ -1,7 +1,9 @@
+//! Decide what to copy or delete, using only the slots we already read.
+
 use crate::identifier::Identifier;
 use crate::status::{Change, Snapshot, Status, classify};
 
-// Everything the policy sees about one slot: the identifier's record and current status at one ref.
+/// The last-sync record and current status of a file at a given location.
 #[derive(Clone, Debug)]
 pub struct Slot {
     pub ref_id: String,
@@ -11,10 +13,12 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// Compare the live status to the record.
     pub fn change(&self) -> Change {
         classify(self.record.as_ref(), &self.status)
     }
 
+    /// The live snapshot, if the file is there.
     fn snapshot(&self) -> Option<&Snapshot> {
         match &self.status {
             Status::Present(s) => Some(s),
@@ -23,22 +27,23 @@ impl Slot {
     }
 }
 
-// One instance of a relation: one identifier's slots across all refs, read and classified.
+/// The slots for a file, after we've read every location.
 #[derive(Clone, Debug)]
 pub struct Instance {
     pub identifier: Identifier,
     pub slots: Vec<Slot>,
 }
 
-// A plan names exact ref mutations. Content is referenced by donor ref, never embedded: the policy sees hashes, the interpreter reads bytes.
+/// Copy bytes from a ref onto another, or delete a file. The policy only names the refs. The engine reads the bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     Copy { from: String, to: String },
     Delete { at: String },
 }
 
-// Executing a plan (even an empty one) puts the current statuses on record.
-// Skip and Pending leave the record untouched, so the situation is re-seen next cycle.
+/// After looking at a file, `decide` returns a plan, a skip, a wait, or an abort.
+/// A `Plan` (empty or not) means we update the record to match what we just saw.
+/// `Skip` and `Pending` keep the record as it is, so the next cycle sees the same situation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     Plan(Vec<Op>),
@@ -48,25 +53,33 @@ pub enum Decision {
     Abort(String),
 }
 
+/// Where we take edited content from.
 #[derive(Clone, Debug)]
 pub enum ContentPolicy {
-    Mirror(String), // label name whose single ref is authoritative
+    /// Copy from this label's ref.
+    Mirror(String),
     Bidirectional,
 }
 
+/// Two sides changed in different ways. We can take the newer edit, prefer a named label, or skip.
 #[derive(Clone, Debug)]
 pub enum ConflictPolicy {
     Newer,
-    Prefer(String), // label name
+    /// Take this label's version.
+    Prefer(String),
     Skip,
 }
 
+/// We can create the file at a location that has never had it, or only sync where it already exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NewPolicy {
-    Replicate, // create the file at refs that never had it
-    Restrict,  // sync only where the file already exists
+    /// Create the file at refs that have never had it.
+    Replicate,
+    /// Sync only where the file already exists.
+    Restrict,
 }
 
+/// Put a deleted file back, spread the deletion, or skip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeletePolicy {
     Propagate,
@@ -74,6 +87,7 @@ pub enum DeletePolicy {
     Skip,
 }
 
+/// A relation's rules for edits, conflicts, new files, and deletions.
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub content: ContentPolicy,
@@ -83,7 +97,7 @@ pub struct Policy {
 }
 
 impl Default for Policy {
-    // The safety-first defaults: never create, restore deletions, leave conflicts alone.
+    /// The defaults are bidirectional edits, skip conflicts, restrict new files, and restore deletions.
     fn default() -> Self {
         Policy {
             content: ContentPolicy::Bidirectional,
@@ -94,15 +108,16 @@ impl Default for Policy {
     }
 }
 
-// What the instance should converge to: the content held by a donor ref, or absence.
+/// The content we want at every location: a copy from this donor, or deleted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Target {
-    Content(String), // donor ref_id
+    /// Copy from the ref with this id.
+    Content(String),
     Absent,
 }
 
 impl Policy {
-    // Pure decision: instance in, decision out. No I/O anywhere in this module.
+    /// Decide what to do with this file, using only the slots already on the instance.
     pub fn decide(&self, inst: &Instance) -> Decision {
         for s in &inst.slots {
             if let Status::Unreadable(e) = &s.status {
@@ -115,7 +130,7 @@ impl Policy {
             Err(d) => return d,
         };
 
-        // The restore flip: a deletion under on_delete=Restore is repaired from a surviving copy rather than propagated. The donor is any unchanged present slot.
+        // Restore: put the deleted file back from any slot that is still present and unchanged.
         let target = if target == Target::Absent {
             match self.on_delete {
                 DeletePolicy::Propagate => Target::Absent,
@@ -134,7 +149,7 @@ impl Policy {
         Decision::Plan(self.ops(inst, &target))
     }
 
-    // Determine the convergence target. Err carries a terminal decision (skip on unresolved conflict).
+    /// Decide what content every location should have. On conflict this returns `Err` with a finished decision (usually skip).
     fn target(&self, inst: &Instance) -> Result<Target, Decision> {
         match &self.content {
             ContentPolicy::Mirror(label) => {
@@ -143,21 +158,22 @@ impl Policy {
                 match (&auth.status, auth.change()) {
                     (Status::Present(_), _) => Ok(Target::Content(auth.ref_id.clone())),
                     (Status::Missing, Change::Disappeared) => Ok(Target::Absent),
-                    // The authority never had the file: nothing to mirror, leave dests alone.
+                    // The mirror source has no file to copy. Leave the destinations alone.
                     (Status::Missing, _) => Err(Decision::Skip("mirror source absent".into())),
                     (Status::Unreadable(_), _) => unreachable!("filtered above"),
                 }
             }
             ContentPolicy::Bidirectional => {
                 let established = inst.slots.iter().any(|s| s.record.is_some());
-                // A slot proposes a target if it changed against its own record. A file that appears where peers already have an established record is a late joiner: it conforms instead of proposing, which is what makes touch-to-bootstrap safe.
+                // A slot proposes if it changed against its own record.
+                // A file that appears where peers already have a record is a late joiner: it takes their content instead of proposing its own. That is why touching an empty dest is safe.
                 let proposals: Vec<&Slot> = inst.slots.iter().filter(|s| match s.change() {
                     Change::Edited | Change::Disappeared => true,
                     Change::Appeared => !established,
                     _ => false,
                 }).collect();
 
-                // Proposals with identical content are one proposal (convergent concurrent edits), keyed by hash; a deletion proposal is keyed by None.
+                // Same content on two sides is one proposal (they edited to the same thing). Deletions key on None.
                 let mut seen: Vec<Option<[u8; 32]>> = Vec::new();
                 let mut targets: Vec<Target> = Vec::new();
                 for s in &proposals {
@@ -173,7 +189,7 @@ impl Policy {
 
                 match targets.len() {
                     0 => {
-                        // No proposals. Late joiners (Appeared while established) still need to conform to the settled content; any unchanged present record-holder donates.
+                        // Nobody proposed. If a late joiner appeared, copy from any slot that still matches its record.
                         let donor = inst.slots.iter().find(|s| s.record.is_some() && s.change() == Change::Unchanged && s.snapshot().is_some());
                         let joiner = inst.slots.iter().any(|s| s.change() == Change::Appeared);
                         match (donor, joiner) {
@@ -188,7 +204,8 @@ impl Policy {
         }
     }
 
-    // Concurrent differing proposals: apply the conflict policy. Under Newer, any edit beats a deletion (a deletion carries no timestamp to compete with).
+    /// Two sides proposed different things. Apply the conflict policy.
+    /// With `Newer`, an edit wins over a deletion because a deletion has no mtime to compare.
     fn tiebreak(&self, inst: &Instance, proposals: &[&Slot]) -> Result<Target, Decision> {
         match &self.conflict {
             ConflictPolicy::Skip => Err(Decision::Skip("conflict: concurrent differing changes".into())),
@@ -212,7 +229,7 @@ impl Policy {
         }
     }
 
-    // Ops to bring every slot to the target, gated by lifecycle policy.
+    /// The copies and deletes that bring every location in line with the target, after applying `on_new` and `on_delete`.
     fn ops(&self, inst: &Instance, target: &Target) -> Vec<Op> {
         let donor_hash = match target {
             Target::Absent => None,
@@ -223,7 +240,7 @@ impl Policy {
                 if Some(snap.hash) == donor_hash { None } else { Some(Op::Copy { from: donor.clone(), to: s.ref_id.clone() }) }
             }
             (Target::Content(donor), Status::Missing) => {
-                // Recreation of a deleted file is a restore, not a creation; only never-existed files are gated by on_new.
+                // Putting a deleted file back is a restore. `on_new` only applies to files that have never existed here.
                 let create_ok = s.record.is_some() || self.on_new == NewPolicy::Replicate;
                 create_ok.then(|| Op::Copy { from: donor.clone(), to: s.ref_id.clone() })
             }
@@ -239,6 +256,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
+    /// A snapshot whose hash is this byte repeated, and whose mtime is `mtime_s` seconds after the epoch.
     fn snap(hash: u8, mtime_s: u64) -> Snapshot {
         Snapshot {
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(mtime_s),
@@ -247,14 +265,17 @@ mod tests {
         }
     }
 
+    /// Build a slot for tests.
     fn slot(ref_id: &str, label: &str, record: Option<Snapshot>, status: Status) -> Slot {
         Slot { ref_id: ref_id.into(), label: label.into(), record, status }
     }
 
+    /// An instance of `f.txt` for tests.
     fn inst(slots: Vec<Slot>) -> Instance {
         Instance { identifier: vec!["f.txt".into()], slots }
     }
 
+    /// Bidirectional policy with this conflict setting. The other fields stay at their defaults.
     fn bidirectional(conflict: ConflictPolicy) -> Policy {
         Policy { content: ContentPolicy::Bidirectional, conflict, ..Policy::default() }
     }
@@ -291,7 +312,7 @@ mod tests {
 
     #[test]
     fn late_join_conforms_instead_of_proposing() {
-        // touch-to-bootstrap: an empty file appears at dest while source has an established record.
+        // Touch-to-bootstrap: an empty file appears at dest while source has an established record.
         // The new file must not win; it gets filled from source.
         let i = inst(vec![
             slot("source", "source", Some(snap(1, 100)), Status::Present(snap(1, 100))),

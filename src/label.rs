@@ -1,3 +1,5 @@
+//! Labels, the folders they expand to, and how a shared name becomes a real path.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -5,29 +7,29 @@ use anyhow::{Context, Result, bail};
 
 use crate::identifier::Identifier;
 
-// How an identifier projects to a real path under a ref's root.
-// Mappings must be invertible; Fixed is many-to-one in general, so validation restricts it to single-identifier relations.
+/// Turn an identifier into a real path under a ref's root.
+/// Mappings have to be invertible. `Fixed` maps many identifiers onto a single filename, so it is only allowed on relations that have a single identifier.
 #[derive(Clone, Debug)]
 pub enum Mapping {
     Direct,
     Fixed(String),
 }
 
-// A full-path template with {name} holes: "~/.claude/skills/{name}/SKILL.md".
-// A hole matches exactly one path component ([^/]+), and the tuple of hole values
-// is the identifier, so labels sharing a hole set name the same file under
-// different layouts. Substitution and matching are inverses by construction.
+/// A path with `{name}` holes, e.g. `~/.claude/skills/{name}/SKILL.md`.
+/// Each hole matches a single path component. The hole values are the identifier, so two templates with the same holes describe the same files under different layouts.
+/// If you fill a template and then match the resulting path, you get the same identifier back.
 #[derive(Clone, Debug)]
 pub struct PathTemplate {
     pub text: String,
-    // Sorted hole names; identifier components follow this order.
+    /// The hole names, sorted. Identifier components follow this order.
     pub holes: Vec<String>,
     segs: Vec<Seg>,
     regex: regex::Regex,
-    // Literal directory before the first hole; walked to discover files.
+    /// The directory before the first hole. Discovery walks this.
     pub root: PathBuf,
 }
 
+/// A literal path fragment or a `{hole}` in a template.
 #[derive(Clone, Debug)]
 enum Seg {
     Lit(String),
@@ -42,6 +44,8 @@ impl PartialEq for PathTemplate {
 impl Eq for PathTemplate {}
 
 impl PathTemplate {
+    /// Split the template into literal and hole segments, build the match regex, and find the directory to walk.
+    /// The string has to start with a literal directory and contain at least one well-formed hole.
     pub fn parse(text: &str) -> Result<PathTemplate> {
         let mut segs = Vec::new();
         let mut rx = String::from("^");
@@ -87,7 +91,7 @@ impl PathTemplate {
         Ok(PathTemplate { text: text.into(), holes, segs, regex: regex::Regex::new(&rx)?, root })
     }
 
-    // Identifier components are hole values in sorted-hole order.
+    /// Fill the holes from the identifier (sorted-hole order) and return the path.
     pub fn substitute(&self, ident: &Identifier) -> PathBuf {
         let mut out = String::new();
         for seg in &self.segs {
@@ -102,6 +106,7 @@ impl PathTemplate {
         PathBuf::from(out)
     }
 
+    /// If `path` matches this template, pull the identifier out of the hole values.
     pub fn identify(&self, path: &Path) -> Option<Identifier> {
         let text = path.to_string_lossy();
         let caps = self.regex.captures(&text)?;
@@ -116,24 +121,26 @@ impl PathTemplate {
     }
 }
 
-// One labeled position of a relation. The label name is arbitrary; nothing below the
-// config layer treats any label specially. A label expands to one or more refs.
+/// A side of a relation.
+/// You pick the name (`source`, `dest`, or anything else). Nothing else in the program treats any name as special.
+/// When we expand a label we get the concrete folders (refs) it currently points at.
 pub struct Label {
     pub name: String,
     pub shape: Shape,
     pub mapping: Mapping,
 }
 
+/// The folders this label expands to. A template uses a whole-path pattern instead.
 pub enum Shape {
     Literal { root: PathBuf },
     Many { roots: Vec<PathBuf> },
-    // Scan discovers roots: each entry of `dir` fills `hole` in `template` to produce one root.
+    /// Each entry of `dir` is substituted for `{hole}` in `template` to make a root.
     Scan { template: String, hole: String, dir: PathBuf },
-    // Template is a whole-path pattern; the hole values are the identifier.
+    /// A whole-path pattern. The hole values are the identifier.
     Template(PathTemplate),
 }
 
-// One concrete referent of a label: a real root plus the vars that produced it.
+/// A concrete folder this label currently points at, plus the variables that produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ref {
     pub label: String,
@@ -142,7 +149,7 @@ pub struct Ref {
     pub mapping_kind: MappingKind,
 }
 
-// Refs carry a value-level copy of their label's mapping so they stay self-contained.
+/// The label's mapping, copied onto the ref so it can locate and identify files on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MappingKind {
     Direct,
@@ -160,7 +167,8 @@ impl From<&Mapping> for MappingKind {
 }
 
 impl Label {
-    // Expand to refs. Scan needs a directory listing; the caller injects it so this stays pure (the engine passes a real reader, tests pass a fixed list).
+    /// Expand this label into the refs it currently points at.
+    /// Scan needs a directory listing. The caller supplies it so this function stays pure: the engine passes a real `read_dir`, tests pass a fixed list.
     pub fn refs(&self, list_dir: &dyn Fn(&Path) -> Result<Vec<String>>) -> Result<Vec<Ref>> {
         let kind = MappingKind::from(&self.mapping);
         let rf = |vars: BTreeMap<String, String>, root: PathBuf| Ref {
@@ -177,7 +185,7 @@ impl Label {
                 mapping_kind: MappingKind::Template(t.clone()),
             }],
             Shape::Literal { root } => vec![rf(BTreeMap::new(), root.clone())],
-            // each root is its own ref; the root itself is the var so ids stay stable under list reordering
+            // Each root is its own ref; the root itself is the var so ids stay stable under list reordering.
             Shape::Many { roots } => roots.iter()
                 .map(|r| rf(BTreeMap::from([("root".into(), r.display().to_string())]), r.clone()))
                 .collect(),
@@ -199,7 +207,7 @@ impl Label {
 }
 
 impl Ref {
-    // Stable identity for state-db rows and plan ops: label name plus sorted var bindings.
+    /// A stable id for database rows and plan ops: the label name, plus sorted `key=value` bindings if any.
     pub fn id(&self) -> String {
         if self.vars.is_empty() {
             self.label.clone()
@@ -209,7 +217,7 @@ impl Ref {
         }
     }
 
-    // Identifier -> real path within this ref.
+    /// Build the path of this identifier under this ref.
     pub fn locate(&self, ident: &Identifier) -> PathBuf {
         match &self.mapping_kind {
             MappingKind::Direct => ident.iter().fold(self.root.clone(), |p, c| p.join(c)),
@@ -218,7 +226,8 @@ impl Ref {
         }
     }
 
-    // Real path -> identifier, None if the path is outside this ref or the mapping cannot recover an identifier from a path (Fixed: identifiers are discovered via direct-mapped peers).
+    /// If this path belongs to this ref, recover its identifier.
+    /// Fixed mappings always return `None`: their identifiers come from the other side of the relation.
     pub fn identify(&self, path: &Path) -> Option<Identifier> {
         match &self.mapping_kind {
             MappingKind::Direct => {
@@ -237,6 +246,7 @@ mod tests {
     use super::*;
     use crate::identifier::identifier_from_string;
 
+    /// A listing callback that ignores the path and returns these names.
     fn fixed_listing(entries: &[&str]) -> impl Fn(&Path) -> Result<Vec<String>> {
         let entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
         move |_| Ok(entries.clone())
@@ -276,11 +286,11 @@ mod tests {
         assert_eq!(t.holes, vec!["name".to_string()]);
         assert_eq!(t.substitute(&vec!["prose".into()]), PathBuf::from("/u/.claude/skills/prose/SKILL.md"));
         assert_eq!(t.identify(Path::new("/u/.claude/skills/prose/SKILL.md")), Some(vec!["prose".to_string()]));
-        // a hole never crosses '/', and stray files under root do not match
+        // A hole never crosses `/`, and stray files under root do not match.
         assert_eq!(t.identify(Path::new("/u/.claude/skills/a/b/SKILL.md")), None);
         assert_eq!(t.identify(Path::new("/u/.claude/skills/prose/OTHER.md")), None);
 
-        // the flat side of the same relation
+        // The flat side of the same relation.
         let s = PathTemplate::parse("/u/scripts/skills/{name}.md").unwrap();
         assert_eq!(s.identify(Path::new("/u/scripts/skills/prose.md")), Some(vec!["prose".to_string()]));
         assert_eq!(s.substitute(&vec!["prose".into()]), PathBuf::from("/u/scripts/skills/prose.md"));

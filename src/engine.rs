@@ -1,57 +1,115 @@
-use std::collections::BTreeSet;
+//! Discover files, decide what to do, and apply the plan.
+//!
+//! We write to a temp file in the same directory, then rename. We write an intent row first and clear it after commit.
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as AnyhowContext, Result, bail};
 
+use crate::archive::Archive;
 use crate::identifier::{Identifier, Pattern, identifier_to_string};
 use crate::policy::{Decision, Instance, Op, Policy, Slot};
 use crate::label::{Label, Mapping, MappingKind, Ref, Shape};
 use crate::status::{Change, Snapshot, Status, classify};
 use crate::store::Store;
 
+/// The labels, glob, and policy that make up a relation. `gate_default` is whether writes start gated.
 pub struct Relation {
     pub name: String,
     pub labels: Vec<Label>,
     pub pattern: Pattern,
     pub policy: Policy,
     pub sync_times: bool,
+    /// The config asked this relation to start gated. The live flag lives in [`Gates`].
+    pub gate_default: bool,
 }
 
-// What happened to one instance during a cycle, for hooks and logs.
+/// While a gate is closed we still observe and plan. File writes and record updates resume when the gate opens.
+/// The config chooses the starting value. The dashboard can change it later. The global gate applies to every relation.
+#[derive(Default)]
+pub struct Gates {
+    pub global: AtomicBool,
+    pub relations: Mutex<BTreeMap<String, bool>>,
+}
+
+impl Gates {
+    /// True when the global gate is closed.
+    pub fn globally_gated(&self) -> bool {
+        self.global.load(Ordering::Relaxed)
+    }
+
+    /// This relation's own flag, without looking at the global gate.
+    pub fn relation_flag(&self, relation: &str) -> bool {
+        *self.relations.lock().unwrap().get(relation).unwrap_or(&false)
+    }
+
+    /// This relation's writes are held: either its own flag is set, or the global gate is closed.
+    pub fn is_gated(&self, relation: &str) -> bool {
+        self.globally_gated() || self.relation_flag(relation)
+    }
+
+    /// Close or open the global gate.
+    pub fn set_global(&self, gated: bool) {
+        self.global.store(gated, Ordering::Relaxed);
+    }
+
+    /// Close or open this relation's gate.
+    pub fn set_relation(&self, relation: &str, gated: bool) {
+        self.relations.lock().unwrap().insert(relation.into(), gated);
+    }
+}
+
+/// After we finish a file we send this to every hook, including the log writers.
 #[derive(Debug)]
 pub enum Event {
     Resolved { relation: String, identifier: String, ops: usize },
+    Held { relation: String, identifier: String, detail: String },
     Skipped { relation: String, identifier: String, reason: String },
     Pending { relation: String, identifier: String, reason: String },
     Errored { relation: String, identifier: String, error: String },
     StaleIntent { relation: String, identifier: String, detail: String },
 }
 
+/// A callback we run for every event.
 pub type Hook = Box<dyn Fn(&Event) + Send>;
 
+/// Run a sync cycle against the store and the configured relations.
 pub struct Engine {
     pub store: Store,
     pub relations: Vec<Relation>,
     pub hooks: Vec<Hook>,
+    pub gates: std::sync::Arc<Gates>,
+    pub archive: Option<Archive>,
 }
 
-// A relation aborts its cycle on Decision::Abort; other relations continue.
+/// Stop this relation. The other relations in the cycle keep going.
 struct RelationAbort(String);
 
 impl Engine {
+    /// Build an engine and set each relation's starting gate from the config.
     pub fn new(store: Store, relations: Vec<Relation>, hooks: Vec<Hook>) -> Engine {
-        Engine { store, relations, hooks }
+        let gates = Gates::default();
+        for rel in &relations {
+            if rel.gate_default {
+                gates.set_relation(&rel.name, true);
+            }
+        }
+        Engine { store, relations, hooks, gates: std::sync::Arc::new(gates), archive: None }
     }
 
+    /// Run every hook with this event.
     fn emit(&self, event: Event) {
         for hook in &self.hooks {
             hook(&event);
         }
     }
 
-    // Surviving intents mean a previous run died mid-operation. Stale plans are not replayed; the affected instances are simply resolved fresh this cycle, which repairs any half-applied state.
+    /// If the last run left intent rows, it died mid-write. We log them, clear them, and let this cycle resolve those files from scratch.
     pub fn recover(&self) -> Result<()> {
         for (relation, ident, detail) in self.store.stale_intents()? {
             self.emit(Event::StaleIntent { relation: relation.clone(), identifier: identifier_to_string(&ident), detail });
@@ -60,7 +118,7 @@ impl Engine {
         Ok(())
     }
 
-    // One full pass: expand labels to refs, validate, discover identifiers, resolve each instance.
+    /// Expand every label, fail if any roots overlap, then resolve each relation.
     pub fn cycle(&self) -> Result<()> {
         let mut expanded: Vec<(usize, Vec<Ref>)> = Vec::new();
         for (i, rel) in self.relations.iter().enumerate() {
@@ -82,10 +140,8 @@ impl Engine {
         Ok(())
     }
 
-    // Identifiers come from asking each ref to identify the files under its root
-    // (Fixed cannot; Template only claims paths matching its pattern), plus every
-    // identifier on record (so a file deleted everywhere visible is still noticed
-    // and its rows collected).
+    /// Walk each ref for files, and also include every identifier already in the record (so a file deleted everywhere is still seen).
+    /// Fixed refs cannot identify files. Template refs only match paths that fit the template.
     fn identifiers(&self, rel: &Relation, refs: &[Ref]) -> Result<BTreeSet<Identifier>> {
         let mut idents: BTreeSet<Identifier> = BTreeSet::new();
         for rf in refs {
@@ -107,11 +163,10 @@ impl Engine {
         Ok(idents)
     }
 
+    /// If a root has records but the folder is gone, wait: that looks like an unmount, not a mass delete.
+    /// Then resolve each identifier.
     fn resolve_relation(&self, rel: &Relation, refs: &[Ref]) -> Result<()> {
-        // Empty-side guard: a root that has committed records but no directory reads as
-        // everything-deleted at once. That is far more likely an unmounted volume or a
-        // moved folder than a real mass deletion, so the relation waits instead of
-        // propagating deletions (or writing into a dead mount point).
+        // Records exist but the folder is gone: almost certainly an unmount or rename, not a mass delete. Wait.
         for rf in refs {
             if !rf.root.is_dir() && self.store.ref_has_records(&rel.name, &rf.id())? {
                 self.emit(Event::Pending {
@@ -144,8 +199,11 @@ impl Engine {
         Ok(())
     }
 
+    /// Read every slot, decide, and apply. If the gate is closed we report the plan and leave the files and the record as they are.
     fn resolve(&self, rel: &Relation, refs: &[Ref], ident: &Identifier) -> Result<()> {
-        // Read every slot's status against its record. A row can be recorded-as-absent, which differs from nothing-on-record: only the latter blocks the early exit below.
+        let gated = self.gates.is_gated(&rel.name);
+
+        // Recorded-as-absent is not the same as never recorded. Only "never recorded" blocks the early exit below.
         let mut slots = Vec::new();
         let mut all_recorded = true;
         for rf in refs {
@@ -156,14 +214,17 @@ impl Engine {
             slots.push((rf, Slot { ref_id: rf.id(), label: rf.label.clone(), record, status }));
         }
 
-        // An identifier absent everywhere is inert; drop its rows and move on.
+        // Missing everywhere: drop the rows and move on.
+        // Forgetting writes the record, so a closed gate skips that too.
         if slots.iter().all(|(_, s)| s.status == Status::Missing) {
-            self.store.forget(&rel.name, ident)?;
+            if !gated {
+                self.store.forget(&rel.name, ident)?;
+            }
             return Ok(());
         }
 
-        // Self-write suppression and the common no-op: everything agrees with the record.
-        // A slot with nothing on record (e.g. a freshly discovered scan root) still resolves, since lifecycle policy may want to populate it.
+        // Everything matches the record: nothing to do.
+        // A brand-new scan root has no record yet, so it still goes through decide (policy may want to create files there).
         if all_recorded && slots.iter().all(|(_, s)| s.change() == Change::Unchanged) {
             return Ok(());
         }
@@ -171,6 +232,16 @@ impl Engine {
         let instance = Instance { identifier: ident.clone(), slots: slots.iter().map(|(_, s)| s.clone()).collect() };
         let ident_str = identifier_to_string(ident);
         match rel.policy.decide(&instance) {
+            Decision::Plan(ops) if gated => {
+                // Gate closed: say what we would do, but do not write files or the record, so the same plan comes back next cycle.
+                if !ops.is_empty() {
+                    let detail: Vec<String> = ops.iter().map(|op| match op {
+                        Op::Copy { from, to } => format!("copy {from} -> {to}"),
+                        Op::Delete { at } => format!("delete {at}"),
+                    }).collect();
+                    self.emit(Event::Held { relation: rel.name.clone(), identifier: ident_str, detail: detail.join("; ") });
+                }
+            }
             Decision::Plan(ops) => {
                 let n = ops.len();
                 self.apply(rel, &slots, ident, ops)?;
@@ -190,7 +261,8 @@ impl Engine {
         Ok(())
     }
 
-    // Execute a validated plan: journal intent, mutate through same-dir temp files and atomic renames, put the outcome on record, clear intent. A crash leaves the intent row as evidence.
+    /// Write the intent, apply the copies and deletes (temp file + rename), update the record, then clear the intent.
+    /// If we crash, the leftover intent is the evidence.
     fn apply(&self, rel: &Relation, slots: &[(&Ref, Slot)], ident: &Identifier, ops: Vec<Op>) -> Result<()> {
         let find = |id: &str| slots.iter().find(|(s, _)| s.id() == id).map(|(s, _)| *s)
             .ok_or_else(|| anyhow::anyhow!("plan references unknown rf {id:?}"));
@@ -203,10 +275,9 @@ impl Engine {
             self.store.write_intent(&rel.name, ident, &detail.join("; "))?;
         }
 
-        // Creates and deletes leave a marker file beside the change before it happens,
-        // removed after commit: a marker still present later means the operation did not
-        // finish. Only creates and deletes — they are rare and hard to reverse; marking
-        // every edit would just teach the reader to ignore markers.
+        // Before a create or delete, drop a marker next to the file. Remove it after commit.
+        // A leftover marker means the operation did not finish.
+        // Only creates and deletes: they are rare and hard to undo. Marking every edit would teach people to ignore the markers.
         let mut markers: Vec<PathBuf> = Vec::new();
         for op in &ops {
             let (word, target_id) = match op {
@@ -223,7 +294,7 @@ impl Engine {
             markers.push(write_marker(&target, &rel.name, ident, target_id, word)?);
         }
 
-        // Track what each rf ends up as, starting from its observed status.
+        // Start from the status we just observed; update as each op lands.
         let mut outcomes: Vec<(String, Option<Snapshot>)> = slots.iter().map(|(rf, s)| {
             let snap = match &s.status {
                 Status::Present(snap) => Some(snap.clone()),
@@ -231,6 +302,17 @@ impl Engine {
             };
             (rf.id(), snap)
         }).collect();
+
+        // Archive the current bytes before we overwrite or delete them.
+        // If the archive write fails, abort: we would otherwise lose the only copy.
+        let preserve = |target_id: &str, path: &Path, reason: &str| -> Result<()> {
+            let Some(arch) = &self.archive else { return Ok(()) };
+            match fs::read(path) {
+                Ok(bytes) => arch.preserve(&self.store, &rel.name, ident, target_id, path, &bytes, reason),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        };
 
         for op in &ops {
             match op {
@@ -242,6 +324,11 @@ impl Engine {
                     let donor_snap = slots.iter().find(|(s, _)| s.id() == *from)
                         .and_then(|(_, s)| match &s.status { Status::Present(sn) => Some(sn.clone()), _ => None })
                         .ok_or_else(|| anyhow::anyhow!("donor {from:?} has no present snapshot"))?;
+                    let overwriting = slots.iter().any(|(rf, s)| rf.id() == *to
+                        && matches!(&s.status, Status::Present(sn) if sn.hash != donor_snap.hash));
+                    if overwriting {
+                        preserve(to, &dest_path, "overwritten")?;
+                    }
                     let mtime = rel.sync_times.then_some(donor_snap.mtime);
                     let written = write_atomic(&dest_path, &bytes, mtime)?;
                     let snap = Snapshot { mtime: written, size: bytes.len() as u64, hash: donor_snap.hash };
@@ -251,7 +338,9 @@ impl Engine {
                 }
                 Op::Delete { at } => {
                     let rf = find(at)?;
-                    match fs::remove_file(rf.locate(ident)) {
+                    let path = rf.locate(ident);
+                    preserve(at, &path, "deleted")?;
+                    match fs::remove_file(&path) {
                         Ok(()) => {}
                         Err(e) if e.kind() == ErrorKind::NotFound => {}
                         Err(e) => return Err(e.into()),
@@ -273,9 +362,8 @@ impl Engine {
         Ok(())
     }
 
-    // A read-only pass for the dashboard: every relation's labels, their current refs, and
-    // each identifier's status and change at each ref. Reads the filesystem and the record,
-    // mutates nothing. Unchanged files cost a stat, not a hash, via the record fastcheck.
+    /// Walk the filesystem and the last-sync record so the dashboard can show every relation.
+    /// Unchanged files only need a stat. We reuse the recorded hash.
     pub fn report(&self) -> Report {
         let mut relations = Vec::new();
         for rel in &self.relations {
@@ -286,6 +374,7 @@ impl Engine {
                     labels: Vec::new(),
                     refs: Vec::new(),
                     rows: Vec::new(),
+                    gated: self.gates.relation_flag(&rel.name),
                     error: Some(e.to_string()),
                 }),
             }
@@ -293,6 +382,7 @@ impl Engine {
         Report { relations }
     }
 
+    /// Build the dashboard view of this relation, including the plan the next open-gate cycle would apply.
     fn report_relation(&self, rel: &Relation) -> Result<RelationReport> {
         let labels = rel.labels.iter().map(|l| LabelView {
             name: l.name.clone(),
@@ -325,53 +415,84 @@ impl Engine {
         let mut rows = Vec::new();
         for ident in &idents {
             let mut cells = Vec::new();
+            let mut slots = Vec::new();
             for rf in &expanded {
                 let record = self.store.record(&rel.name, ident, &rf.id())?.flatten();
                 let status = read_status(&rf.locate(ident), record.as_ref());
                 let change = classify(record.as_ref(), &status);
+                slots.push(Slot { ref_id: rf.id(), label: rf.label.clone(), record, status: status.clone() });
                 cells.push(CellView { status, change });
             }
-            rows.push(RowView { identifier: identifier_to_string(ident), cells });
+            // Same decision the next open-gate cycle will make.
+            let all_recorded = slots.iter().all(|s| s.record.is_some());
+            let settled = all_recorded && cells.iter().all(|c| c.change == Change::Unchanged);
+            let (plan, note) = if settled {
+                (Vec::new(), None)
+            } else {
+                match rel.policy.decide(&Instance { identifier: ident.clone(), slots }) {
+                    Decision::Plan(ops) => (ops, None),
+                    Decision::Skip(reason) if reason == "no changes" => (Vec::new(), None),
+                    Decision::Skip(reason) | Decision::Pending(reason) | Decision::Abort(reason) => (Vec::new(), Some(reason)),
+                    Decision::NoDecision => (Vec::new(), None),
+                }
+            };
+            rows.push(RowView { identifier: identifier_to_string(ident), cells, plan, note });
         }
 
-        Ok(RelationReport { name: rel.name.clone(), labels, refs, rows, error: None })
+        Ok(RelationReport {
+            name: rel.name.clone(),
+            labels,
+            refs,
+            rows,
+            gated: self.gates.relation_flag(&rel.name),
+            error: None,
+        })
     }
 }
 
-// The dashboard's view of the world; plain typed data, rendered elsewhere.
-// Rows are identifier-major: one row per identifier, one cell per ref, cells in `refs` order.
+/// The dashboard builds the page from this. Each row is a file. Each cell is a location, in the same order as `refs`.
 pub struct Report {
     pub relations: Vec<RelationReport>,
 }
 
+/// The dashboard shows these labels, locations, and file rows for a relation.
 pub struct RelationReport {
     pub name: String,
     pub labels: Vec<LabelView>,
     pub refs: Vec<RefView>,
     pub rows: Vec<RowView>,
+    /// This relation's own flag. The global gate lives on [`Gates`].
+    pub gated: bool,
     pub error: Option<String>,
 }
 
+/// The location line prints this name, mapping, and shape.
 pub struct LabelView {
     pub name: String,
     pub mapping: String,
     pub shape: String,
 }
 
+/// Column headers and plan text use this. It has the location's id, its root, and whether the folder exists.
 pub struct RefView {
     pub label: String,
     pub id: String,
     pub root: PathBuf,
     pub root_exists: bool,
-    // For template refs, the whole-path pattern this ref matches and writes.
+    /// The whole-path pattern, when this is a template ref.
     pub pattern: Option<String>,
 }
 
+/// A file's status at each location, plus the plan for the next cycle (or the reason we have no plan).
 pub struct RowView {
     pub identifier: String,
     pub cells: Vec<CellView>,
+    /// The plan the next open-gate cycle would apply. `note` is set instead when the decision is a skip or a conflict.
+    pub plan: Vec<Op>,
+    pub note: Option<String>,
 }
 
+/// Status of a file at a location, and whether it matches the record.
 pub struct CellView {
     pub status: Status,
     pub change: Change,
@@ -389,7 +510,7 @@ impl std::fmt::Debug for RelationAbort {
 }
 impl std::error::Error for RelationAbort {}
 
-// The directory listing that Scan shapes expand through: immediate subdirectories, sorted.
+/// Immediate subdirectories of `dir`, sorted. Scan uses this when expanding roots.
 fn list_subdirs(dir: &Path) -> Result<Vec<String>> {
     let mut entries = Vec::new();
     for e in fs::read_dir(dir).with_context(|| format!("scanning {}", dir.display()))? {
@@ -402,7 +523,9 @@ fn list_subdirs(dir: &Path) -> Result<Vec<String>> {
     Ok(entries)
 }
 
-// Stat and hash one path. The mtime+size fastcheck reuses the recorded hash when both match; a tool that edits bytes while preserving both slips past this, same trade as Unison's fastcheck.
+/// Stat and hash this path.
+/// If mtime and size still match the record, we reuse the recorded hash (Unison's fastcheck).
+/// A tool that changes bytes without touching mtime or size will slip through.
 fn read_status(path: &Path, record: Option<&Snapshot>) -> Status {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -428,8 +551,8 @@ fn read_status(path: &Path, record: Option<&Snapshot>) -> Status {
     }
 }
 
-// Write via a temp file in the destination directory, then rename into place.
-// Returns the resulting mtime.
+/// Write to a temp file in the same directory, then rename over `path`.
+/// The return value is the mtime after the rename.
 fn write_atomic(path: &Path, bytes: &[u8], mtime: Option<std::time::SystemTime>) -> Result<std::time::SystemTime> {
     let parent = path.parent().ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)?;
@@ -445,9 +568,8 @@ fn write_atomic(path: &Path, bytes: &[u8], mtime: Option<std::time::SystemTime>)
 const TEMP_SUFFIX: &str = ".replica-write";
 const MARKER_SUFFIX: &str = ".replica.tmp";
 
-// A plain-text breadcrumb at the change site, written before a create or delete and
-// removed after the record commits. Plain text, not JSON: the likely reader is a person
-// wondering what touched their file, not a parser.
+/// Write a small text file next to the create or delete, and remove it after commit.
+/// Plain text on purpose: the reader is someone wondering what happened to their file.
 fn write_marker(target: &Path, relation: &str, ident: &Identifier, ref_id: &str, op: &str) -> Result<PathBuf> {
     let marker = PathBuf::from(format!("{}{MARKER_SUFFIX}", target.display()));
     if let Some(parent) = marker.parent() {
@@ -462,15 +584,16 @@ fn write_marker(target: &Path, relation: &str, ident: &Identifier, ref_id: &str,
          ref:        {ref_id}\n\
          op:         {op}\n\
          started:    {started}\n\
-         note:       this marker is removed when the operation commits; if you are\n\
-         \x20           reading it, the operation is in progress or died partway.\n",
+         note:       this marker is removed when the operation commits. if you are reading it, the operation is still running or died partway.\n",
         std::process::id(),
         identifier_to_string(ident),
     ))?;
     Ok(marker)
 }
 
-// Identifiers of all regular files under a root. A missing root yields no identifiers (the rf simply has nothing yet). Symlinks are skipped: out of the v0 node model. Leftover temp files from a crashed write are never identifiers.
+/// Relative paths of every regular file under `root`.
+/// A missing root counts as empty (the ref has nothing yet).
+/// We skip symlinks, leftover `.replica-write` files, and leftover `.replica.tmp` files.
 fn walk_identifiers(root: &Path) -> Result<Vec<Identifier>> {
     let mut idents = Vec::new();
     let mut stack = vec![PathBuf::new()];
@@ -498,7 +621,7 @@ fn walk_identifiers(root: &Path) -> Result<Vec<Identifier>> {
     Ok(idents)
 }
 
-// Overlapping real roots across refs make ownership ambiguous and can feed one relation's writes into another; rejected outright in v0.
+/// Fail if two refs share a root or nest inside each other. Otherwise a relation can write into another's files.
 fn validate_no_overlaps(relations: &[Relation], expanded: &[(usize, Vec<Ref>)]) -> Result<()> {
     let mut roots: Vec<(&str, &Ref)> = Vec::new();
     for (i, refs) in expanded {

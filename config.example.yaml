@@ -1,4 +1,4 @@
-# Copy to config.yaml and adjust. All fields shown; commented ones are defaults.
+# Copy to config.yaml and adjust. All fields are shown; commented ones are defaults.
 
 state_db: "~/scripts/replica/live/state.db"
 interval: "1m"
@@ -8,38 +8,37 @@ dashboard:
     # refresh: 10           # seconds between dashboard refreshes
 
 entries:
-    # Defaults merged into every entry below where the entry has no value of its own.
+    # Defaults copied into every entry below that does not set the same field itself.
     # {name} expands to the entry's key; any other {field} expands to that entry's field.
     _:
         content: "bidirectional"
         log: "~/scripts/replica/live/logs/{name}.log"
 
-    # Two-way sync of .js files between two folders. An endpoint given as a bare string
-    # is a plain root folder.
+    # Two-way sync of .js files between two folders.
+    # An endpoint given as a bare string is a plain root folder.
     mylibrary:
         source: "~/Desktop/mylibrary"
         dest: "~/scripts/desktop-library"
         pattern: "*.js"
-        # content: "bidirectional"    # or: "mirror(source)" - one-way
+        # content: "bidirectional"    # or: "mirror(source)" for one-way
         # conflict: "skip"            # or: "newer", "prefer(source)"
-        # on_new: "restrict"          # or: "replicate" - create missing copies
+        # on_new: "restrict"          # or: "replicate" to create missing copies
         # on_delete: "restore"        # or: "propagate", "skip"
         # sync_times: true
 
-    # One file kept in step with a differently-named copy.
+    # One file kept in step with a copy that has a different name.
     nginx-default:
         source: "/etc/nginx/conf.d"
         dest: { root: "~/Desktop", rename: "nginx-conf.txt" }
 
-    # A whole-path template per side: each {hole} matches one path component, and the
-    # hole values are the file's shared identity, so the two templates form an
-    # invertible rewrite between naming schemes.
+    # A whole-path template on each side.
+    # Each {hole} matches one path component, and the hole values are the file's shared identity, so the two templates describe the same files under different layouts.
     skills:
         source: "~/scripts/skills/{name}.md"
         dest: "~/.claude/skills/{name}/SKILL.md"
         on_new: "replicate"
 
-    # One file stamped into every project folder, discovered each cycle.
+    # One file copied into every project folder, rediscovered each cycle.
     style-guide-all:
         source: "~/scripts/rules"
         dest:

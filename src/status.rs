@@ -1,6 +1,8 @@
+//! A file's mtime, size, and hash, and how that compares to the last-sync record.
+
 use std::time::SystemTime;
 
-// What one ref's file looked like at a moment. The hash is the authoritative equality; mtime/size are the cheap pre-filter.
+/// mtime, size, and content hash. We treat two snapshots as the same file if the hashes match. mtime and size just let us skip hashing when nothing looks different.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub mtime: SystemTime,
@@ -8,7 +10,7 @@ pub struct Snapshot {
     pub hash: [u8; 32],
 }
 
-// The current state of an identifier at one ref. Absence is a first-class status.
+/// What we found at a path: the file is there, it's gone, or we couldn't read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Present(Snapshot),
@@ -16,7 +18,7 @@ pub enum Status {
     Unreadable(String),
 }
 
-// Per-ref change, derived by comparing the status against what is on record from the last resolution.
+/// The live file compared to the last-sync record: same, edited, new, gone, or unreadable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     Unchanged,
@@ -26,6 +28,7 @@ pub enum Change {
     Unreadable,
 }
 
+/// Compare the live status to the recorded snapshot, or to having no record at all.
 pub fn classify(record: Option<&Snapshot>, status: &Status) -> Change {
     match (record, status) {
         (_, Status::Unreadable(_)) => Change::Unreadable,

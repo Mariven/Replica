@@ -120,6 +120,52 @@ tr:hover td { background: var(--tint) }
 .more { color: var(--faint); padding: 4px 10px 0; font-size: 12.5px }
 
 .ctl { margin-left: auto; display: flex; gap: 6px; align-items: baseline }
+
+/* Gate switch: a two-seat toggle. The current seat is lit and inert; the other seat is the button that moves the switch. */
+.seglab { font-size: 11px; color: var(--faint); margin-right: -2px }
+.seg {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    overflow: hidden;
+    vertical-align: middle;
+    background: var(--panel);
+}
+.seg form { display: contents }
+.segbtn, .segseat {
+    border: 0;
+    background: transparent;
+    color: var(--faint);
+    font: inherit;
+    font-size: 11.5px;
+    line-height: 18px;
+    padding: 0 9px;
+}
+.segbtn { cursor: pointer; border-radius: 0 }
+.segbtn:hover { background: var(--tint); color: var(--dim) }
+.segseat + form .segbtn, .segseat + .segseat, form + .segseat { border-left: 1px solid var(--line2) }
+.segseat.lit.ok { background: var(--ok-bg); color: var(--ok) }
+.segseat.lit.warn { background: var(--warn-bg); color: var(--warn) }
+.seg.off { opacity: .55 }
+
+/* Plan line under a pending file: what the next sync would do. */
+.plan { font-size: 11.5px; color: var(--dim); margin-top: 2px }
+.plan.warn { color: var(--warn) }
+.plab {
+    display: inline-block;
+    font-size: 10px;
+    border: 1px solid var(--line2);
+    border-radius: 2px;
+    padding: 0 4px;
+    margin-right: 5px;
+    color: var(--faint);
+    background: var(--tint);
+}
+.plan.warn .plab { color: var(--warn); border-color: var(--warn-line); background: var(--warn-bg) }
+
+.sctl { margin-left: auto; display: flex; gap: 10px; align-items: center }
+.mlink { color: var(--acc); text-decoration: none; font-size: 12.5px }
+.mlink:hover { text-decoration: underline }
 .btn {
     background: var(--panel);
     border: 1px solid var(--line);

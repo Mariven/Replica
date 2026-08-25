@@ -1,3 +1,43 @@
+//! Load relations and settings from YAML.
+//!
+//! `entries` maps a name to a body. Any key that is not a reserved field (`pattern`, `content`, `conflict`, `on_new`, `on_delete`, `sync_times`, `gate`, `log`) is a label.
+//! `source` and `dest` are ordinary names. `mirror(x)` and `prefer(x)` can refer to any label you declared.
+//! Policy values are plain strings (`bidirectional`, `mirror(label)`, and so on).
+//!
+//! ```yaml
+//! state_db: "~/scripts/replica/live/state.db"
+//! interval: "30s"
+//! entries:
+//!     mylibrary:
+//!         source: "~/Desktop/mylibrary"
+//!         dest: "~/scripts/desktop-library"
+//!         pattern: "*.js"
+//!         content: "bidirectional"        # or: "mirror(source)"
+//!         conflict: "newer"               # or: "skip" (default), "prefer(source)"
+//!         on_new: "restrict"              # or: "replicate"
+//!         on_delete: "restore"            # or: "propagate", "skip"
+//!         sync_times: true
+//!         log: "~/scripts/replica/live/logs/mylibrary.log"
+//! ```
+//!
+//! An endpoint is a bare path (`~/x`), a template with `{name}` holes (`~/x/{name}.md`; see [`PathTemplate`]), or a mapping (`root` + `rename`, `many`, `scan`).
+//!
+//! `_` holds defaults, copied into every other entry that does not set the same field.
+//! Default keys and string values may contain `{placeholders}`, filled from the entry's own string fields plus `{name}` (the entry's key):
+//!
+//! ```yaml
+//! entries:
+//!     _:
+//!         content: "bidirectional"
+//!         log: "~/scripts/replica/live/logs/{name}.log"
+//!     skills:
+//!         source: "~/scripts/skills/{name}.md"      # entry values are not rewritten
+//!         dest: "~/.claude/skills/{name}/SKILL.md"
+//! ```
+//!
+//! Expansion is innermost-first and repeats until the string stops changing, so a default can build a placeholder out of other fields.
+//! A cycle is an error. An unknown placeholder is left as written.
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -11,46 +51,7 @@ use crate::identifier::Pattern;
 use crate::policy::{ConflictPolicy, ContentPolicy, DeletePolicy, NewPolicy, Policy};
 use crate::label::{Mapping as PathMapping, Label, PathTemplate, Shape};
 
-// The user-facing YAML surface. `entries` is a mapping from entry name to entry body;
-// label names are arbitrary: any key that is not one of the reserved fields (pattern,
-// content, conflict, on_new, on_delete, sync_times, log) declares a label.
-// `source`/`dest` are conventions, not keywords; `mirror(x)` / `prefer(x)` may name any
-// declared label. Policies are a typed configuration AST, no expression parsing.
-//
-//     state_db: "~/scripts/replica/live/state.db"
-//     interval: "30s"
-//     entries:
-//         mylibrary:
-//             source: "~/Desktop/mylibrary"
-//             dest: "~/scripts/desktop-library"
-//             pattern: "*.js"
-//             content: "bidirectional"        # or: "mirror(source)"
-//             conflict: "newer"               # or: "skip" (default), "prefer(source)"
-//             on_new: "restrict"              # or: "replicate"
-//             on_delete: "restore"            # or: "propagate", "skip"
-//             sync_times: true
-//             log: "~/scripts/replica/live/logs/mylibrary.log"
-//
-// An endpoint is a bare path string ("~/x" — a plain root), a whole-path template with
-// {name} holes ("~/x/{name}.md" — see PathTemplate), or a mapping for the longer forms
-// (root + rename, many, scan).
-//
-// The special entry `_` holds defaults merged into every other entry where the entry has
-// no value of its own. Default keys and string values may contain {placeholders}, resolved
-// against the entry's own scalar string fields plus {name}, the entry's key:
-//
-//     entries:
-//         _:
-//             content: "bidirectional"
-//             log: "~/scripts/replica/live/logs/{name}.log"
-//         skills:
-//             source: "~/scripts/skills/{name}.md"      # entry values are never rewritten
-//             dest: "~/.claude/skills/{name}/SKILL.md"
-//
-// Expansion is innermost-first and repeats until stable, so defaults can build
-// placeholders out of other fields; a reference cycle is an error. A placeholder that
-// resolves to nothing stays literal.
-
+/// The config file as serde reads it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
@@ -58,35 +59,79 @@ pub struct ConfigFile {
     pub state_db: Option<String>,
     #[serde(default = "default_interval")]
     pub interval: String,
+    /// Start with the global gate closed. We still observe and plan. File writes wait until the dashboard opens the gate, or you restart with `gate: false`.
+    #[serde(default)]
+    pub gate: bool,
+    #[serde(default)]
+    pub archive: Option<ArchiveSettings>,
     #[serde(default)]
     pub dashboard: Option<DashboardConfig>,
     pub entries: Mapping,
 }
 
+/// Serde default: 30 seconds.
 fn default_interval() -> String { "30s".into() }
 
-// What main() consumes; carried out of the config file verbatim.
+/// Top-level settings passed to `main`, taken as-is from the config file.
 pub struct Settings {
     pub state_db: Option<String>,
     pub interval: String,
+    pub gate: bool,
+    pub archive: Option<ArchiveSettings>,
     pub dashboard: Option<DashboardConfig>,
 }
 
+/// Overwritten and deleted content goes here, up to this size cap.
+/// Defaults: `archive/` beside the state database, 100 MB.
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveSettings {
+    #[serde(default)]
+    pub dir: Option<String>,
+    #[serde(default = "default_archive_cap")]
+    pub cap: String,
+}
+
+/// Serde default: 100 MB.
+fn default_archive_cap() -> String { "100MB".into() }
+
+/// Parse a size like `100MB`, `1.5G`, or a bare byte count.
+pub fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: f64 = num.parse().with_context(|| format!("bad size {s:?}"))?;
+    let mult: u64 = match unit.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "KB" | "K" => 1 << 10,
+        "MB" | "M" => 1 << 20,
+        "GB" | "G" => 1 << 30,
+        "TB" | "T" => 1 << 40,
+        other => bail!("bad size unit {other:?} in {s:?}"),
+    };
+    Ok((n * mult as f64) as u64)
+}
+
+/// The loopback dashboard's port, event history size, and refresh interval.
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct DashboardConfig {
     pub port: u16,
-    // How many events the dashboard remembers.
+    /// We keep this many recent events in memory.
     #[serde(default = "default_recent_events")]
     pub recent_events: usize,
-    // Seconds between page auto-refreshes.
+    /// Seconds between page auto-refreshes.
     #[serde(default = "default_refresh")]
     pub refresh: u64,
 }
 
+/// Serde default: keep 200 recent events.
 fn default_recent_events() -> usize { 200 }
+
+/// Serde default: refresh the dashboard every 10 seconds.
 fn default_refresh() -> u64 { 10 }
 
+/// The labels and policy fields we parsed from a config entry.
 #[derive(Deserialize)]
 pub struct EntryConfig {
     #[serde(flatten)]
@@ -103,18 +148,29 @@ pub struct EntryConfig {
     pub on_delete: String,
     #[serde(default = "default_true")]
     pub sync_times: bool,
+    /// Start this entry gated. We still plan and report. File writes wait until the dashboard opens the gate.
+    #[serde(default)]
+    pub gate: bool,
     #[serde(default)]
     pub log: Option<String>,
 }
 
+/// Serde default: bidirectional content.
 fn default_content() -> String { "bidirectional".into() }
+
+/// Serde default: skip conflicts.
 fn default_conflict() -> String { "skip".into() }
+
+/// Serde default: restrict new files.
 fn default_on_new() -> String { "restrict".into() }
+
+/// Serde default: restore deletions.
 fn default_on_delete() -> String { "restore".into() }
+
+/// Serde default: true (`sync_times`).
 fn default_true() -> bool { true }
 
-// An endpoint: a bare path string (root, or whole-path template when it has {holes}),
-// or the longer mapping forms.
+/// A label's endpoint: a bare path (or a template if it has `{holes}`), or one of the mapping forms.
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum EndpointSpec {
@@ -122,8 +178,7 @@ pub enum EndpointSpec {
     Full(EndpointConfig),
 }
 
-// One of: a single root (optionally with a fixed-name rename), many roots, a scan,
-// or a whole-path template.
+/// The longer endpoint forms: a single root (optionally renamed), several roots, a scan, or a path template.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EndpointConfig {
@@ -139,6 +194,7 @@ pub struct EndpointConfig {
     pub path: Option<String>,
 }
 
+/// Discover a root per directory entry by filling `hole` in `template`.
 #[derive(Deserialize)]
 pub struct ScanConfig {
     pub template: String,
@@ -146,15 +202,17 @@ pub struct ScanConfig {
     pub dir: String,
 }
 
+/// Expand `~` to the home directory.
 pub fn expand_path(s: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(s).into_owned())
 }
 
-// "mirror(source)" / "prefer(dest)" style single-argument forms.
+/// Pull the argument out of a `name(arg)` form such as `mirror(source)` or `prefer(dest)`.
 fn parse_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     s.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')
 }
 
+/// Parse a duration like `30s`, `1m`, or `500ms`.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
@@ -168,6 +226,7 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
 }
 
 impl EndpointSpec {
+    /// Build a `Label` from this endpoint, expanding `~` and parsing templates.
     fn into_label(self, name: &str) -> Result<Label> {
         match self {
             EndpointSpec::Short(s) => {
@@ -188,6 +247,7 @@ impl EndpointSpec {
 }
 
 impl EndpointConfig {
+    /// Require exactly one of `root` / `many` / `scan` / `path`, plus an optional `rename`.
     fn into_label(self, name: &str) -> Result<Label> {
         let mapping = match &self.rename {
             Some(leaf) => PathMapping::Fixed(leaf.clone()),
@@ -215,6 +275,7 @@ impl EndpointConfig {
 }
 
 impl EntryConfig {
+    /// Check that policy labels exist, then build a [`Relation`].
     pub fn into_relation(self, name: &str) -> Result<Relation> {
         let content = if self.content == "bidirectional" {
             ContentPolicy::Bidirectional
@@ -258,8 +319,7 @@ impl EntryConfig {
         let labels = self.labels.into_iter()
             .map(|(label_name, ep)| ep.into_label(&label_name))
             .collect::<Result<Vec<_>>>()?;
-        // Templates carry identity in their hole values, so a template label can only
-        // relate to other templates, and all must agree on the hole set.
+        // Templates carry identity in their hole values, so a template label can only relate to other templates, and all must agree on the hole set.
         if let Some(first) = labels.iter().find_map(|l| match &l.shape {
             Shape::Template(t) => Some((l.name.as_str(), &t.holes)),
             _ => None,
@@ -284,10 +344,12 @@ impl EntryConfig {
             pattern,
             policy: Policy { content, conflict, on_new, on_delete },
             sync_times: self.sync_times,
+            gate_default: self.gate,
         })
     }
 }
 
+/// The label a content policy refers to, if any.
 fn content_label(c: &ContentPolicy) -> Option<&str> {
     match c {
         ContentPolicy::Mirror(l) => Some(l),
@@ -295,6 +357,7 @@ fn content_label(c: &ContentPolicy) -> Option<&str> {
     }
 }
 
+/// The label a conflict policy refers to, if any.
 fn conflict_label(c: &ConflictPolicy) -> Option<&str> {
     match c {
         ConflictPolicy::Prefer(l) => Some(l),
@@ -302,19 +365,15 @@ fn conflict_label(c: &ConflictPolicy) -> Option<&str> {
     }
 }
 
-// ---- defaults merge and {placeholder} expansion ----
-
 const MAX_EXPANSION_PASSES: usize = 8;
 
-// One expansion pass: replace each innermost {word} whose word is in scope; anything
-// unresolvable stays literal. Innermost-first is what lets values assemble new
-// placeholders out of other fields.
+/// Replace each innermost `{word}` that is in scope. Unknown words stay as written.
+/// Innermost-first lets a value build a new placeholder out of other fields.
 fn expand_once(s: &str, scope: &BTreeMap<String, String>) -> String {
     let mut out = String::new();
     for c in s.chars() {
         if c == '}' {
-            // Backtrack in the output for the nearest open brace; substituted text
-            // participates, which is what lets values assemble new placeholders.
+            // Backtrack in the output for the nearest open brace; substituted text participates, which is what lets values assemble new placeholders.
             if let Some(open) = out.rfind('{') {
                 if let Some(v) = scope.get(&out[open + 1..]) {
                     let v = v.clone();
@@ -329,6 +388,7 @@ fn expand_once(s: &str, scope: &BTreeMap<String, String>) -> String {
     out
 }
 
+/// Expand `{placeholders}` until the string stops changing, or fail on a reference cycle.
 fn expand_str(s: &str, scope: &BTreeMap<String, String>) -> Result<String> {
     let mut cur = s.to_string();
     for _ in 0..MAX_EXPANSION_PASSES {
@@ -341,6 +401,7 @@ fn expand_str(s: &str, scope: &BTreeMap<String, String>) -> Result<String> {
     bail!("circular reference expanding {s:?}")
 }
 
+/// Expand placeholders in every string inside a YAML value.
 fn expand_yaml(v: &Value, scope: &BTreeMap<String, String>) -> Result<Value> {
     Ok(match v {
         Value::String(s) => Value::String(expand_str(s, scope)?),
@@ -360,9 +421,9 @@ fn expand_yaml(v: &Value, scope: &BTreeMap<String, String>) -> Result<Value> {
     })
 }
 
-// Merge `_` defaults into one entry. Local values win; default keys and values are
-// expanded against the entry's own scalar string fields plus {name}, the entry's key.
-// Entry values themselves are never rewritten.
+/// Copy `_` defaults into this entry where it has no value of its own.
+/// Placeholders in default keys and values are filled from the entry's string fields plus `{name}`.
+/// Values already on the entry are left alone.
 fn merge_defaults(name: &str, entry: &mut Mapping, defaults: &Mapping) -> Result<()> {
     let mut scope: BTreeMap<String, String> = entry.iter()
         .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), v.as_str()?.to_owned())))
@@ -380,6 +441,7 @@ fn merge_defaults(name: &str, entry: &mut Mapping, defaults: &Mapping) -> Result
     Ok(())
 }
 
+/// Parse the YAML into settings, relations, and per-relation log paths.
 pub fn load(yaml: &str) -> Result<(Settings, Vec<Relation>, Vec<(String, PathBuf)>)> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config")?;
     let mut entries = file.entries;
@@ -404,7 +466,13 @@ pub fn load(yaml: &str) -> Result<(Settings, Vec<Relation>, Vec<(String, PathBuf
         relations.push(entry.into_relation(&name)?);
     }
     Ok((
-        Settings { state_db: file.state_db, interval: file.interval, dashboard: file.dashboard },
+        Settings {
+            state_db: file.state_db,
+            interval: file.interval,
+            gate: file.gate,
+            archive: file.archive,
+            dashboard: file.dashboard,
+        },
         relations,
         logs,
     ))
@@ -414,6 +482,7 @@ pub fn load(yaml: &str) -> Result<(Settings, Vec<Relation>, Vec<(String, PathBuf
 mod tests {
     use super::*;
 
+    /// Build a placeholder scope from string pairs.
     fn scope(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
@@ -428,10 +497,10 @@ mod tests {
 
     #[test]
     fn expansion_is_recursive_innermost_first() {
-        // {b}{c}{d} with b="{{a", c="}}" assembles {{a}} -> {e} -> f; {d} stays literal.
+        // `{b}{c}{d}` with `b="{{a"`, `c="}}"` assembles `{{a}}` -> `{e}` -> `f`; `{d}` stays literal.
         let sc = scope(&[("a", "e"), ("b", "{{a"), ("c", "}}"), ("e", "f")]);
         assert_eq!(expand_str("{b}{c}{d}", &sc).unwrap(), "f{d}");
-        // and keys expand too, via the same function
+        // Keys expand too, via the same function.
         assert_eq!(expand_str("{a}x", &sc).unwrap(), "ex");
     }
 
