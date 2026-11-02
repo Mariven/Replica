@@ -307,7 +307,13 @@ impl Engine {
             match self.store.note_replica(&rel.name, r.id(), Path::new(r.pattern.text()))? {
                 Noted::Same => {}
                 // A replica seen for the first time has no records, so keys settled among its peers must be decided again with it present.
-                Noted::New => fresh = true,
+                // Under a gate nothing is written, so the row is removed again and the replica stays new until an ungated cycle fills it.
+                Noted::New => {
+                    fresh = true;
+                    if gated {
+                        self.store.forget_replica(&rel.name, r.id())?;
+                    }
+                }
                 Noted::Moved(previous) => {
                     self.emit(Event::Relocated { relation: rel.name.clone(), replica: r.id().to_owned(), from: previous.clone(), to: r.pattern.text().to_owned() });
                     if !gated {
@@ -573,7 +579,11 @@ impl Engine {
         }
         let found = self.discover(rel, replicas, &records)?;
         let unresolved = self.store.unresolved_for(&rel.name)?;
-        let full = self.stale_policy.lock().unwrap().contains(&rel.name);
+        // The report evaluates fully under the same conditions as a cycle: a changed policy, or a replica the store has not seen.
+        let mut full = self.stale_policy.lock().unwrap().contains(&rel.name);
+        for r in replicas {
+            full |= !self.store.replica_known(&rel.name, r.id())?;
+        }
         let name_of: BTreeMap<&str, &str> = replicas.iter().zip(&names).map(|(r, n)| (r.id(), n.as_str())).collect();
         let mut rows = Vec::new();
         for key in &found.keys {

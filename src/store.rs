@@ -199,6 +199,12 @@ impl Store {
         })
     }
 
+    /// True when the replica's pattern has been noted before, so it is not new to the relation.
+    pub fn replica_known(&self, relation: &str, id: &str) -> Result<bool> {
+        let n: i64 = self.conn.prepare_cached("SELECT COUNT(*) FROM replica WHERE rel=?1 AND id=?2")?.query_row(params![relation, id], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     /// Replica identities with records in a relation.
     pub fn replicas_with_records(&self, relation: &str) -> Result<BTreeSet<String>> {
         let mut stmt = self.conn.prepare_cached("SELECT DISTINCT replica FROM record WHERE rel=?1")?;

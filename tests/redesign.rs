@@ -311,3 +311,27 @@ fn a_cycle_over_named_relations_leaves_the_others_alone() {
     eng.cycle(None).unwrap();
     assert_eq!(read(d.join("f.txt")).unwrap(), "1");
 }
+
+#[test]
+fn a_replica_discovered_under_a_closed_gate_is_filled_once_the_gate_opens() {
+    let tmp = TempDir::new().unwrap();
+    let projects = tmp.path().join("Projects");
+    write(tmp.path().join("rules/main.md"), "v1");
+    fs::create_dir_all(projects.join("alpha")).unwrap();
+    let eng = engine(&tmp, &format!(
+        "    style:\n      sites:\n        source: {}/rules/main.md\n        dest: \"{}/{{project}}/docs/main.md\"\n      fanout: [project]\n      flow: \"source -> dest [edit create]\"\n",
+        tmp.path().display(), projects.display()
+    ));
+    eng.cycle(None).unwrap();
+    assert_eq!(read(projects.join("alpha/docs/main.md")).unwrap(), "v1");
+    // A new project appears while the gate is closed: the plan is held, and the replica must still count as new afterwards.
+    eng.set_global_gate(true);
+    fs::create_dir_all(projects.join("beta")).unwrap();
+    eng.cycle(None).unwrap();
+    eng.cycle(None).unwrap();
+    assert_eq!(read(projects.join("beta/docs/main.md")), None);
+    assert_eq!(eng.report().relations[0].state(true), RelationState::Held(1));
+    eng.set_global_gate(false);
+    eng.cycle(None).unwrap();
+    assert_eq!(read(projects.join("beta/docs/main.md")).unwrap(), "v1");
+}
