@@ -1,16 +1,18 @@
 # Running Replica as a macOS service
 
-Replica runs as a per-user LaunchAgent. launchd starts it at login, relaunches it after a crash, and leaves it down after a clean exit.
+Replica runs as a per-user LaunchAgent under launchd control. At user login, launchd starts the daemon, reviving the process after unexpected crashes, while leaving the process offline after clean termination.
 
 ## Install
 
-Build, then write the agent plist and load it:
+Build the release binary, create the log directory (launchd does not create the directories its log paths point into), and check the config before registering the agent:
 
 ```sh
 cargo build --release
+mkdir -p ~/scripts/replica/live/logs
+./target/release/replica --config config.yaml --check
 ```
 
-`~/Library/LaunchAgents/com.mariven.replica.plist` (adjust paths):
+Populate `~/Library/LaunchAgents/com.mariven.replica.plist`, adjusting paths to match your user account:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +34,10 @@ cargo build --release
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
     <key>StandardOutPath</key>
     <string>/Users/YOU/scripts/replica/live/logs/daemon.log</string>
     <key>StandardErrorPath</key>
@@ -40,60 +46,69 @@ cargo build --release
 </plist>
 ```
 
+`ProcessType Background` and `LowPriorityIO` keep the directory walks from competing with foreground work.
+
 ```sh
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.mariven.replica.plist
 ```
 
-`KeepAlive` with `SuccessfulExit: false` means: relaunch on any nonzero exit, stay down after a clean one. The dashboard's restart button exits nonzero on purpose. Its halt button exits cleanly on purpose.
+With `SuccessfulExit: false` configured under `KeepAlive`, launchd restarts replica after unexpected terminations, while leaving the process stopped after clean exits. When you click restart in the dashboard, the daemon finishes the file operation in progress, then exits with non-zero status so launchd starts a new instance. When you click halt, or launchd sends SIGTERM, the daemon finishes the operation in progress and exits with status zero, leaving the service stopped.
 
 ## Control
 
-The dashboard (`dashboard.port` in the config) is the main interface. Its controls are ordinary POSTs to the loopback server, so they are also scriptable:
+The dashboard, running at the port in `dashboard.port`, provides the primary user interface. Its buttons issue HTTP POST requests to the local server, so you can script every action directly:
 
 ```sh
-curl -X POST localhost:18516/pause    # stop cycling; keep serving the dashboard
-curl -X POST localhost:18516/resume   # cycle again immediately
-curl -X POST localhost:18516/restart  # exit nonzero; launchd relaunches and rereads the config
-curl -X POST localhost:18516/halt     # exit cleanly; launchd leaves it stopped
+curl -X POST localhost:18516/sync  # run a sync now instead of waiting for the next scheduled one
+curl -X POST localhost:18516/pause  # pause sync cycles while continuing dashboard service
+curl -X POST localhost:18516/resume  # resume, starting with an immediate pass
+curl -X POST 'localhost:18516/gate?to=closed'  # hold every write; to=open releases it (quote the URL: zsh treats ? as a glob)
+curl -X POST 'localhost:18516/gate?to=open&rel=mylibrary'  # one entry's gate alone
+curl -X POST localhost:18516/restart  # validate the config, then exit non-zero so launchd restarts with it
+curl -X POST localhost:18516/halt  # exit with status zero so launchd leaves the process stopped
 ```
 
-`GET /status.json` returns machine-readable state (running/paused, pid, uptime, last and next sync, cycle/op/error counts, files awaiting sync) for scripts and menubar widgets.
+The server accepts POSTs only with a loopback `Host` header and, when a browser sends one, an `Origin` of this dashboard, so a web page from another site cannot drive it.
 
-Use `launchctl` for things the process cannot do from inside:
+External scripts and status bar widgets query `GET /status.json` for telemetry. The body carries the process state (`running` or `paused`), the global gate (`open` or `closed`), the pid, version, and uptime, the last sync's start time and duration, the next sync time, when the report was taken and whether it is a snapshot from before a sync that is running now, counters for cycles, applied operations, and distinct errors since start, the number of files awaiting sync and held by a gate, and one entry per relation with its name, state, gated flag, and counts of files awaiting sync and held.
+
+While a sync runs, the dashboard and `/status.json` serve the report published at the end of the previous sync, marked as such, instead of waiting for the engine. Between syncs they read live state.
+
+Manage service lifecycle actions externally through `launchctl`:
 
 ```sh
-launchctl kickstart gui/$UID/com.mariven.replica     # start (for example after halt)
-launchctl kickstart -k gui/$UID/com.mariven.replica  # kill and restart
-launchctl print gui/$UID/com.mariven.replica         # detailed status
+launchctl kickstart gui/$UID/com.mariven.replica  # start a halted instance
+launchctl kickstart -k gui/$UID/com.mariven.replica  # terminate and restart the running process
+launchctl print gui/$UID/com.mariven.replica  # inspect service registration and runtime state
 ```
 
 ## Maintain
 
-Change the config: edit `config.yaml`, then `POST /restart`. The config is read once at startup; nothing watches it.
+To update configuration settings, edit `config.yaml`, run `replica --config config.yaml --check` to catch typos and overlapping roots, and send `POST /restart`. Replica loads configuration values during startup, requiring a restart to apply subsequent edits. A restart request first loads the config itself and refuses to exit if the file does not load, so a typo cannot crash-loop the agent.
 
-Update the code: `cargo build --release`, then `POST /restart`. The agent runs the binary from `target/release` in place.
+To run updated code, compile with `cargo build --release` and send `POST /restart`. The LaunchAgent executes the newly compiled binary directly from `target/release`.
 
-Edit the plist: launchd does not reread a plist on kickstart. Reload it:
+Reload modified plists by restarting the agent registration, as kickstart commands retain previously cached definitions:
 
 ```sh
-launchctl bootout gui/$UID com.mariven.replica
+launchctl bootout gui/$UID/com.mariven.replica
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.mariven.replica.plist
 ```
 
-If bootout reports an I/O error while the job is crash-looping, the older `launchctl unload ~/Library/LaunchAgents/com.mariven.replica.plist` still dislodges it.
+Monitor service logs in `live/logs/`. Synchronization events and errors stream sequentially to `daemon.err`, each line stamped with the local time. Standard output routes to `daemon.log`. Paths configured with a `log:` directive write their events into their dedicated files as well. A condition that persists across cycles, such as a held plan, an open conflict, or a failing operation, is logged when it appears or changes, not on every cycle.
 
-Read the logs: `live/logs/daemon.err` is the event stream (one line per resolution, skip, or error). `daemon.log` is stdout. Entries with a `log:` path also append their own events there.
+A root that contains the state database, the archive directory, or a log file is refused at startup and by `--check`, since the daemon would otherwise sync its own files. Roots that merely nest inside each other are reported on the dashboard and skipped each cycle, since a scan can produce them at any time.
 
-Risky edits: `POST /pause` first, move files around, check that the dashboard shows what you expect, then `POST /resume`.
+Before reorganizing files, send `POST /pause` to hold synchronization passes. Verify planned changes in the dashboard, then send `POST /resume` to process the updates.
 
-Do not run `--once` against the live state database while the service is up: the two processes would race on the same record. Pause or halt first.
+Halt the service before running `--once` against the production database. A second instance refuses to start while the first holds the lock file beside the database.
 
 ## Remove
 
 ```sh
 curl -X POST localhost:18516/halt
-launchctl bootout gui/$UID com.mariven.replica
+launchctl bootout gui/$UID/com.mariven.replica
 rm ~/Library/LaunchAgents/com.mariven.replica.plist
 ```
 
-The state database and logs live in `live/`. Delete that folder to forget everything on record. Removal does not touch the synced files themselves.
+The `live/` directory stores the state database with its write-ahead log and shared-memory files (`state.db-wal`, `state.db-shm`), the lock file that keeps a second daemon off the database (`state.db.lock`), the archive of overwritten and deleted revisions, and the log files. The three database files belong together; move or back them up as one. Deleting it leaves the synchronized files in place but discards the sync baseline and every archived revision: the next run treats every file as newly seen and aligns differing copies according to the propagate rules, with nothing to restore from.

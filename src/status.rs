@@ -1,8 +1,8 @@
-//! A file's mtime, size, and hash, and how that compares to the last-sync record.
+//! Filesystem state tracking across synchronization cycles. Capture file snapshots and evaluate live disk status against previous runs to detect modifications.
 
 use std::time::SystemTime;
 
-/// mtime, size, and content hash. We treat two snapshots as the same file if the hashes match. mtime and size just let us skip hashing when nothing looks different.
+/// Captured file state holding modification timestamp, byte count, and content hash. Verify timestamps and byte counts before hashing file contents to confirm identical data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub mtime: SystemTime,
@@ -10,7 +10,7 @@ pub struct Snapshot {
     pub hash: [u8; 32],
 }
 
-/// What we found at a path: the file is there, it's gone, or we couldn't read it.
+/// Observed disk state for a target path. Record a snapshot when present, mark the path missing when absent, or capture the error message when a read fails.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
     Present(Snapshot),
@@ -18,7 +18,7 @@ pub enum Status {
     Unreadable(String),
 }
 
-/// The live file compared to the last-sync record: same, edited, new, gone, or unreadable.
+/// Path transition between synchronization passes. Classify an entry as unchanged, edited, appeared, disappeared, or unreadable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
     Unchanged,
@@ -28,7 +28,7 @@ pub enum Change {
     Unreadable,
 }
 
-/// Compare the live status to the recorded snapshot, or to having no record at all.
+/// Compare current filesystem status with a prior snapshot to determine how a path changed. Check read errors first, check presence or absence next, and compare hashes when both records exist.
 pub fn classify(record: Option<&Snapshot>, status: &Status) -> Change {
     match (record, status) {
         (_, Status::Unreadable(_)) => Change::Unreadable,
@@ -38,5 +38,26 @@ pub fn classify(record: Option<&Snapshot>, status: &Status) -> Change {
         (Some(r), Status::Present(s)) => {
             if r.hash == s.hash { Change::Unchanged } else { Change::Edited }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(hash: u8) -> Snapshot {
+        Snapshot { mtime: SystemTime::UNIX_EPOCH, size: 1, hash: [hash; 32] }
+    }
+
+    #[test]
+    fn classify_covers_every_record_and_status_pair() {
+        assert_eq!(classify(None, &Status::Missing), Change::Unchanged);
+        assert_eq!(classify(None, &Status::Present(snap(1))), Change::Appeared);
+        assert_eq!(classify(Some(&snap(1)), &Status::Missing), Change::Disappeared);
+        assert_eq!(classify(Some(&snap(1)), &Status::Present(snap(1))), Change::Unchanged);
+        assert_eq!(classify(Some(&snap(1)), &Status::Present(snap(2))), Change::Edited);
+        // A read failure takes precedence over any record.
+        assert_eq!(classify(None, &Status::Unreadable("denied".into())), Change::Unreadable);
+        assert_eq!(classify(Some(&snap(1)), &Status::Unreadable("denied".into())), Change::Unreadable);
     }
 }

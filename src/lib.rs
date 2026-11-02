@@ -1,16 +1,15 @@
-//! Replica keeps related local files in sync.
+//! Replica synchronizes related local files.
+//! To coordinate paths across a relation, scan filesystem entries at each target.
+//! After comparing content hashes against stored history, apply policy rules to schedule copy or delete operations.
 //!
-//! A *relation* is a set of files that should have the same content.
-//! Each cycle we look at those files, compare them to a stored record, and copy or delete according to the relation's policy.
-//!
-//! - [`identifier`]: relative paths and glob filters
-//! - [`label`]: labels, refs, and path templates
-//! - [`status`]: snapshots and how they differ from the last sync
-//! - [`policy`]: which copies and deletes to run
-//! - [`store`]: the last-sync record, the intent journal, and the archive index
-//! - [`archive`]: content we keep when overwriting or deleting
-//! - [`engine`]: a full cycle, from discovery through applying a plan
-//! - [`config`]: load relations from YAML
+//! - [`identifier`]: Resolve relative paths, filtering candidate entries with glob patterns.
+//! - [`label`]: Expand path templates using label definitions.
+//! - [`status`]: Inspect filesystem trees, recording divergence from stored sync states.
+//! - [`policy`]: Evaluate operational rules before scheduling copy or delete actions.
+//! - [`store`]: Persist sync states, intent journals, archive indices on disk.
+//! - [`archive`]: Preserve target files prior to replacement or removal.
+//! - [`engine`]: Drive sync cycles from target discovery through plan execution.
+//! - [`config`]: Parse relation specifications from YAML input files.
 
 pub mod archive;
 pub mod identifier;

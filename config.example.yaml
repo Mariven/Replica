@@ -1,51 +1,87 @@
-# Copy to config.yaml and adjust. All fields are shown; commented ones are defaults.
+# Before running replication, copy this template to config.yaml, adapting parameters to the local environment. Inspect commented fields to verify default values for optional parameters.
+# Every path must be absolute or start with ~. Relative paths are rejected, because the daemon's working directory under launchd is /.
+# Roots must be disjoint: no root may lie inside another root, across all entries, and no root may contain state_db, the archive directory, or a log file. A rename endpoint claims only the one file it names.
 
 state_db: "~/scripts/replica/live/state.db"
-interval: "1m"
+interval: "1m"  # 30s by default. Units: ms, s, m, h. Zero is rejected.
+# gate: false  # Start with every write held. Open the gate from the dashboard. --gate on the command line does the same.
+# archive:
+#     dir: "~/scripts/replica/live/archive"  # Overwritten and deleted revisions, content-addressed. Defaults to an archive folder beside state_db.
+#     cap: "100MB"  # Oldest revisions of the largest relation are evicted past this size.
 dashboard:
     port: 18516
     recent_events: 200
-    # refresh: 10           # seconds between dashboard refreshes
+    # refresh: 10  # Set the dashboard refresh interval in seconds.
 
 entries:
-    # Defaults copied into every entry below that does not set the same field itself.
-    # {name} expands to the entry's key; any other {field} expands to that entry's field.
+    # Supply baseline options inherited across entries defined below.
+    # To override a default section, define a matching top-level block directly within an entry. The whole block is replaced, not merged.
+    # Reference the entry identifier with {name}, interpolating additional values through matching top-level string attributes.
     _:
-        content: "bidirectional"
+        propagate:
+            change: "source <-> dest"
+            create: "source -> dest"
         log: "~/scripts/replica/live/logs/{name}.log"
 
-    # Two-way sync of .js files between two folders.
-    # An endpoint given as a bare string is a plain root folder.
+    # Synchronize JavaScript files across source and destination folders.
+    # Supply plain string paths to target directory roots directly.
+    # Patterns are globs over the relative path. `*` and `?` stay within one path segment, so "*.js" matches top-level files alone;
+    # "**/*.js" matches at any depth, "docs/*.md" matches one level down, and "{a,b}.md" lists alternatives.
+    # Matching is case-sensitive even on case-insensitive volumes, there is no exclude list, and symbolic links are skipped.
+    # Enclose patterns containing semicolons or brace expansions in quotes, preventing YAML from interpreting braces as mapping syntax.
     mylibrary:
-        source: "~/Desktop/mylibrary"
-        dest: "~/scripts/desktop-library"
+        labels:
+            source: "~/Desktop/mylibrary"
+            dest: "~/scripts/desktop-library"
         pattern: "*.js"
-        # content: "bidirectional"    # or: "mirror(source)" for one-way
-        # conflict: "skip"            # or: "newer", "prefer(source)"
-        # on_new: "restrict"          # or: "replicate" to create missing copies
-        # on_delete: "restore"        # or: "propagate", "skip"
+        propagate:
+            change: "source <-> dest"
+            create: "source -> dest"  # Replicate new source files to dest, restoring deleted destination files from source.
+            delete: "source -> dest"  # Propagate deletions from source to dest, confining deletions locally when leaving this field blank.
+            conflict: "source mtime dest"  # Resolve collisions by modification timestamp. Specify fixed precedence with ">", evaluate size, or leave blank to bypass resolution. Rules apply in order; a tie falls through to the next rule.
         # sync_times: true
+        # gate: false  # Hold this entry's writes from startup while still planning and reporting.
 
-    # One file kept in step with a copy that has a different name.
+    # Replicate a configuration file while assigning an alternate destination filename.
+    # A rename endpoint holds exactly one file, so the pattern names the one source file to carry.
     nginx-default:
-        source: "/etc/nginx/conf.d"
-        dest: { root: "~/Desktop", rename: "nginx-conf.txt" }
+        labels:
+            source: "/etc/nginx/conf.d"
+            dest: { root: "~/Documents", rename: "nginx-conf.txt" }
+        pattern: default.conf
 
-    # A whole-path template on each side.
-    # Each {hole} matches one path component, and the hole values are the file's shared identity, so the two templates describe the same files under different layouts.
+    # Map files across divergent directory hierarchies using whole-path templates.
+    # Capture path components through bracketed tokens, aligning corresponding locations across endpoints.
+    # A string with {holes} is a template; the mapping form `{ path: "..." }` is the same thing spelled out.
     skills:
-        source: "~/scripts/skills/{name}.md"
-        dest: "~/.claude/skills/{name}/SKILL.md"
-        on_new: "replicate"
+        labels:
+            source: "~/scripts/skills/{name}.md"
+            dest: { path: "~/.claude/skills/{name}/SKILL.md" }
 
-    # One file copied into every project folder, rediscovered each cycle.
+    # Distribute matching files across multiple target directories by supplying a list of destination endpoints.
+    cursor-rules:
+        labels:
+            source: "~/scripts/styles"
+            dest:
+                - "~/Desktop/Projects/alpha/.cursor/rules"
+                - "~/Desktop/Projects/beta/.cursor/rules"
+        pattern: "*.mdc"
+        propagate:
+            change: "source <-> dest"
+            create: "source <-> dest"
+            delete: "source <-> dest"
+
+    # Distribute files dynamically across project trees, discovering target directories on every cycle via filesystem scans.
+    # Every folder under dir becomes one destination, including folders such as .git or node_modules if they are there.
     style-guide-all:
-        source: "~/scripts/rules"
-        dest:
-            scan:
-                template: "~/Desktop/Projects/{project}/docs/style"
-                hole: "project"
-                dir: "~/Desktop/Projects"
+        labels:
+            source: "~/scripts/rules"
+            dest:
+                scan:
+                    template: "~/Desktop/Projects/{project}/docs/style"
+                    hole: "project"
+                    dir: "~/Desktop/Projects"
         pattern: "main_style.md"
-        content: "mirror(source)"
-        on_new: "replicate"
+        propagate:
+            change: "source -> dest"
+            create: "source -> dest"

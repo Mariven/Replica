@@ -1,23 +1,42 @@
 # To do
 
-Ideas carried over from the README, plus items from the earlier notes in `docs/old/` that still need a design decision.
+Pending design decisions and operational mechanisms for the sync daemon.
 
 ## Mechanisms
 
-- Notify-based invalidation (FSEvents / inotify) feeding the same poll loop, for latency shorter than the interval. The earlier notes' rule: the scan is the source of truth, watch events are hints. Correctness must not depend on event delivery.
-- Per-hole value constraints in `path:` templates (`{date:\d+}`-style, for dated logs).
-- A conflict backup directory (write each conflicting variant to `dir/<ident>.<label>.bak` before resolving) and a three-way merge command. Open questions: backup naming and retention, and where the merge base comes from. The earlier notes suggest optionally storing last-synced content per relation, not just its hash.
-- A sweep policy for record rows whose identifiers have been gone for a long time, beyond the current all-missing collection.
-- Force a full re-resolution when a relation's policy changes. The per-instance early exit assumes the policy that committed the record is still in force.
+- Dispatch filesystem notifications (FSEvents on macOS, inotify on Linux) into the poll loop to evaluate changes before scheduled intervals:
+    - The daemon scans directories directly to determine authoritative state.
+    - Incoming notification events trigger evaluation passes early without relying on event delivery guarantees.
+- Support regex parameter constraints in `path:` templates, such as `{date:\d+}` for dated log files.
+- Conflict backup directory and three-way merge resolution:
+    - Write conflicting variants to `dir/<ident>.<label>.bak` before resolving divergences.
+    - Specify retention limits and naming schemes for backup files.
+    - Store baseline file contents per relation alongside recorded hashes to supply merge bases during three-way merges.
+- Prune database records for identifiers missing across extended sync windows, expanding cleanup beyond records with all replicas absent.
+- Prune record and unresolved rows for refs removed from the configuration. A stale unresolved row keeps its identifier under full evaluation every cycle.
+- Trigger full re-resolution across managed records upon modifying relation policies. Evaluation routines currently skip matching file hashes, bypassing updated policy rules on established records.
 
-## Safety (from the earlier notes)
+## Safety
 
-- A big-delete threshold: the missing-root guard covers a vanished root, but a root that survives while most of its recorded files disappear still propagates under `on_delete: propagate`. A fraction-based abort (Unison's confirmbigdel) needs a threshold choice and a per-relation override.
-- Bootstrap `seed` as a first-observation policy distinct from `on_new`. The earlier transition table separates them: ignore | seed | replicate. Current restrict / replicate covers the practical cases.
-- Marker files carry a small field set. The earlier full format also listed the log path, database path, donor hash, and policy. Those would have to be passed into the engine's apply path.
-- A DANGER.README dropped beside the state database when it is inconsistent, and an optional per-relation heartbeat file. The earlier notes already flag the heartbeat as risky: always-present markers get learned as noise.
+- Abort batch deletions when the proportion of removed files exceeds a configured limit:
+    - The engine halts propagation when an entire root directory disappears, while deleting most files within an intact root still propagates removals along delete edges.
+    - Define a deletion ratio threshold with per-relation overrides.
+- Distinguish initial replica seeding from ongoing discovery along create edges, defining explicit actions for files encountered during initial scans: ignore, seed, or replicate.
+- Include extended diagnostic metadata in conflict marker files, passing the log path, database path, donor hash, and applied policy through the engine apply pipeline.
+- Health indicators and failure alerts:
+    - Write a `DANGER.README` alert file beside the state database upon detecting state inconsistency.
+    - Evaluate optional per-relation heartbeat files for monitoring sync activity, weighing operational visibility against the noise of persistent marker files.
+
+## Configuration
+
+- Replace the endpoint notation: `scan` with `template`, `hole`, and `dir`, plus `root` with `rename`. Find a form as direct as the `propagate` statements.
 
 ## Interface
 
-- Menubar sidecar: a SwiftBar plugin or a small Swift app that polls `/status.json` and posts `/pause`, `/resume`, `/restart`, with reveal-config and open-dashboard items. Kept out of the daemon: an in-process NSStatusItem needs the main thread's event loop, which would invert the process structure for a convenience.
-- Windows port: the engine is portable except path-separator handling in template matching (normalize to forward slashes when turning paths into strings). The service story is Task Scheduler or the windows-service crate. A tray icon has the same event-loop question as the menubar. See docs/service-mac.md for what a service-windows.md would parallel.
+- Menubar companion:
+    - Poll `/status.json` and post commands to `/pause`, `/resume`, and `/restart` via a SwiftBar plugin or a dedicated Swift application, with shortcuts to reveal configuration files and launch dashboards.
+    - Run the status item in an external process, avoiding main-thread GUI event loop constraints inside the sync daemon.
+- Windows port:
+    - Normalize path separators to forward slashes when converting paths to strings during template matching.
+    - Manage daemon execution through Task Scheduler or the `windows-service` crate, matching the architecture in `docs/service-mac.md`.
+    - Isolate system tray integration into a companion process to avoid coupling GUI event loops with daemon execution.
