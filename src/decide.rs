@@ -1,6 +1,6 @@
 //! Decide the desired state of each replica of a key, given the transitions of all its replicas and the policy of the relation.
 //!
-//! The rules from docs/design.md each appear below as a small function under the same name: Voice, Admit, Contest, Stand, Conform, Resolve, Hold, Operation.
+//! The rules from docs/design.md each appear below as a small function under the same name: Voice, Admit, Hold, Contest, Stand, Conform, Resolve, Operation.
 //! The decision for a target replica depends only on the observations of the key, so the outcome is the same in whatever order the replicas are visited.
 //! The result is an assignment: for each replica, keep its content, take a content hash, or become absent. Replicas held back are listed with their reasons.
 

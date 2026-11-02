@@ -1,55 +1,39 @@
-# Replica, redesigned
+# Replica
 
-Replica keeps related files in agreed states across locations on the local machine. This document describes the second design of the daemon from the ground up: the primitives it is built on, how a cycle moves data through them, how a person configures, observes, controls it. The present code under `src/` at the start of the `redesign` branch is the first design; where this document refers to it, the reference is historical.
+Replica is a daemon that keeps copies of files in sync across several folders on the same machine. You describe the copies and the rules in a YAML file. The daemon scans the folders, works out what each copy should contain, and writes, deletes, archives, and reports accordingly.
 
+This document is the reference manual for the design. It defines the terms, states the rules the daemon follows, describes the data it stores, and documents the configuration file and the interfaces. [README.md](../README.md) is the short introduction. [todo.md](todo.md) lists open work.
 
-## Purpose
+## Terms
 
-A person declares relations. Each relation says which locations hold copies of the same files, in which directions edits, new files, and deletions may travel between those locations, and how to settle a disagreement. On a schedule, or sooner when the filesystem reports a change, the daemon reads the locations and compares what it finds against the state it recorded after the previous agreement. From that comparison it decides what each location should hold now, then writes, deletes, archives, records, and reports. Correctness comes from the scan itself. A notification merely brings the next scan sooner.
+A few words are used throughout and are defined in full in later sections:
 
-The redesign keeps that purpose. It changes the primitives so that each idea appears once in the code. A person assembles a configuration from shared parts instead of repeating the same fields in each relation. A watcher, a command line, or a dashboard can drive the daemon from outside. The daemon in turn can run a compiler or copy files to a host through the event stream it already emits.
+- A relation is a named group of folders or files that the daemon keeps in sync. Relations are declared under `relations` in the configuration file.
+- A site is a named role inside a relation, such as `source` or `dest`. A replica is a concrete folder or file playing that role. A site with a fan-out variable can have several replicas.
+- A key identifies one file across the replicas of a relation.
+- The basis is the record the database holds for a key at a replica from the last time the daemon committed that key.
+- The engine is the part of the daemon that runs cycles. The executor is the part that applies a plan to disk.
 
+## The cycle
 
-## Vocabulary
+The daemon works in cycles. At the start of a cycle it expands the sites of all relations into replicas and checks that no two replicas overlap on disk. Then it handles the relations one at a time. For each relation it:
 
-A **relation** is a named declaration relating several sites.
+1. Records the pattern of each replica in the database. If a replica's pattern has changed since the last run, the daemon reports a relocation.
+2. Checks that each replica's root folder exists. If a root is missing but the database holds snapshots for that replica, the daemon reports the relation as unavailable and skips the rest of these steps.
+3. Walks each replica to discover the keys of the relation.
+4. Observes each key at each replica and compares what it finds with the basis. If nothing changed at any replica, the daemon skips the key.
+5. Decides, for each changed key, what each replica should hold. The flow and the resolver of the relation control this decision.
+6. Applies the plan: stage, archive, journal, write, commit.
+7. Reports what happened through events, the relation's log, and the dashboard. Then it runs the shell commands configured under `on` (see Actions and transforms).
 
-A **site** is a named role in a relation, such as `source`, `dest`, `backup`. The flow statements of the relation refer to sites by these names.
+## Gates
 
-A **pattern** is the location of a site: an absolute path with variables in braces. A site may list several patterns.
-
-A **variable** inside a pattern stands for one path segment, or, written `{name...}`, for one or more segments. A variable appearing in the pattern of each site of the relation is an **identity variable**. The relation lists its **fan-out variables** under `fanout`. Such a variable may appear on some sites only. When a variable appears on some sites only without being listed there, the loader treats it as a mistake, most often a typo, and rejects the relation.
-
-A **key** is a binding of the identity variables. Two files at two sites belong together exactly when they bind the identity variables to the same values. A relation with no identity variables has exactly one key, the empty binding.
-
-A **replica** is a concrete location: a site, one of its patterns, a binding of that pattern's fan-out variables. A site whose patterns have no fan-out variables has one replica per pattern. The daemon discovers the replicas of a fan-out variable by reading the filesystem at the depth of the variable.
-
-A **basis** is the state the daemon recorded for a key at a replica after the last successful cycle: a snapshot (modification time, size, content hash), or a tombstone meaning the daemon saw the file deleted there, or nothing at all when the daemon has never recorded the key at that replica.
-
-An **observation** is what the daemon finds on disk for a key at a replica during a cycle: a snapshot, or missing, or unreadable with a reason.
-
-A **transition** is the comparison of a basis against an observation: unchanged, edited, appeared, recreated over a tombstone, disappeared, unreadable.
-
-A **flow** is the directed graph over the sites of a relation. Each edge carries the kinds of transition it transports: `edit`, `create`, `delete`, in any subset.
-
-A **resolver** is an ordered list of rules for settling a key whose replicas receive differing proposals.
-
-An **assignment** is the daemon's decision for one key: for each replica, keep what is there, take a particular content hash, or become absent, together with the replicas held back and the reasons.
-
-A **plan** is the list of filesystem operations an assignment implies against the current observations, phrased by content hash rather than by donor, so the executor may take the bytes from any replica holding them or from the blob store.
-
-The **blob store** is a content-addressed directory beside the state database. It holds archived revisions of overwritten and deleted files, along with donor content staged during a plan and the output of transforms.
-
-A **medium** is the trait through which the engine lists, reads, writes, removes files. The local filesystem is the only implementation in this design; the trait exists so that a remote one can be added later without changes to the engine.
-
-An **action** is a shell command the daemon runs when an event of a chosen kind occurs for a relation.
-
-A **transform** is a shell command through which content passes while traveling along one edge, so that the receiving site holds the command's output rather than the sender's bytes.
+Each relation has a gate, and there is a global gate as well. A gate is a flag. While the global gate or a relation's own gate is closed, the daemon still runs steps 1 through 5 for that relation and shows the resulting plan, but it writes nothing to the files and nothing to the database. You open and close gates from the dashboard or the command line.
 
 
 ## Patterns
 
-A pattern is written as an absolute path, or a path starting with `~`, in which some segments contain variables.
+A pattern is a path with variables in it. Variables are written in braces. Each site of a relation is written as one or more patterns.
 
     ~/Desktop/mylibrary/{path...}
     ~/scripts/skills/{name}.md
@@ -57,276 +41,515 @@ A pattern is written as an absolute path, or a path starting with `~`, in which 
     ~/Desktop/Projects/{project}/docs/style/main_style.md
     /etc/nginx/conf.d/default.conf
 
-A variable `{name}` matches exactly one segment, so `~/scripts/skills/{name}.md` matches `prose.md` but not `a/b.md`. A variable `{name...}` matches one or more segments and stands for a relative path. A pattern may contain at most one such variable, placed after any other variables in the pattern. A segment may mix literal text with a variable, as in `{name}.md`, though it may hold at most one variable. The same variable may not appear twice in one pattern.
+### Syntax
 
-The loader reads a pattern ending in `/` as the same pattern followed by `{path...}`, so `~/Desktop/mylibrary/` relates whole trees. A pattern with no variables locates exactly one file. Since a relation with no identity variables has exactly one key, the renamed-file case needs no special mapping: two literal file paths at two sites relate the two files, whatever their names.
+- A pattern must be an absolute path, or start with `~/`. The loader replaces `~` with the home directory.
+- `{name}` matches a single path segment, or part of a segment. A segment may combine literal text with a variable, as in `{name}.md`, but a segment may hold only one variable. A variable always matches at least one character, so `{name}.md` does not match a file named `.md`.
+- `{name...}` matches one or more segments, in other words a relative path. A pattern may hold only one such variable, and it must come after the other variables of the pattern.
+- A variable name is made of ASCII letters, digits, and underscores, and starts with a letter or an underscore. A name may appear once in a pattern.
+- A pattern that ends in `/` means the whole tree below that folder. The loader rewrites it by appending `{path...}`. The bare `/` is an error, and so is a pattern with an empty segment, such as `/a//b`.
+- A pattern with no variables names a single file.
 
-A variable may carry a constraint after a colon: `{file: *.js}` matches one segment ending in `.js`; `{path...: docs/**/*.md}` matches relative paths under `docs` ending in `.md`. Constraints are globs over the bound text, where `*` and `?` stay within one segment and `**` crosses segments. A constraint written `~re~` is a regular expression anchored at both ends, for cases such as `{date: ~\d{4}-\d\d-\d\d~}`. Constraints may also be written in the relation's `where` block, keyed by variable, which keeps long patterns readable; a variable constrained in both places must satisfy both.
+### Constraints
 
-To match a path against a pattern, the daemon binds each variable to the text in its position and checks the constraints; the result is a binding. To substitute, it fills a full binding into the pattern and gets a path back. Under the restrictions above, when the daemon substitutes a binding into a pattern and then matches the resulting path, it gets the same binding back. The two operations undo each other on any path that fits the pattern. The loader enforces the restrictions, so this holds for each pattern in a running configuration.
+A constraint limits the values a variable may take. Write it after the variable name, separated by a colon:
 
-From a pattern the daemon derives:
+- A glob, as in `{file: *.js}` or `{path...: docs/**/*.md}`. `*` and `?` match within one segment. `**` matches across segments.
+- A regular expression between tildes, as in `{date: ~\d{4}-\d\d-\d\d~}`. The loader anchors it at both ends.
+- Either of the above with a leading `!`, meaning the opposite. `{project: !node_modules}` matches any single segment other than `node_modules`.
 
-- The **root**: the longest literal directory prefix before the first variable. The walk for keys starts there.
-- The **depth**: how many segments below the root a matching file lies. A pattern without a `{path...}` variable has a fixed depth. With that variable the depth is unbounded in general. When its constraint has no `**`, the depth becomes fixed again: the constraint's segment count added to the fixed part.
-- The **footprint**: the root, or the single file when the pattern has no variables. Two footprints overlap when one lies within the other. When a footprint overlaps another relation's footprint, or one of the daemon's own files such as the database, the blob store, or a log, the daemon refuses the relation. Since a fan-out can produce a new overlap at any time, the dashboard shows the overlap on each cycle until it is gone.
-- The **tail**: the part of a matched path below the root. Ignore globs test the tail.
+A relation may also hold constraints in its `where` block, keyed by variable name. Each entry is one constraint or a list of constraints. The loader attaches them to each pattern that uses that variable. When a variable has constraints in both places, a value must satisfy all of them.
 
-A site may list several patterns, or a map from replica names to patterns. A list item becomes a replica named by its pattern text; a map item becomes a replica named by its key. Either way the replica's identity is independent of how many siblings it has.
+### Matching and substitution
 
+Matching takes a path and produces a binding, that is, a value for each variable. The daemon reads each variable's value out of the path and checks the constraints. Matching is case-sensitive.
 
-## Keys and replicas
+Substitution takes a binding and produces a path. The daemon writes the values into the pattern. Substitution fails if the binding lacks one of the pattern's variables, if a value is empty, if the value of a single-segment variable contains `/`, or if a constraint rejects a value.
 
-At the start of a cycle, the daemon expands each site of a relation into replicas. A pattern without fan-out variables is one replica. For a pattern with fan-out variables, the daemon walks down from the root; at the segment holding a fan-out variable it lists the directory and binds the variable to each entry that satisfies the constraints, then continues below each of them. Each complete binding becomes one replica. A fan-out variable name may appear on several sites. Its bindings stay local to the replicas of each site; the daemon pairs files across sites through the identity variables alone.
+The two operations are inverses. Matching a path and substituting the resulting binding gives the path back. Substituting a binding and matching the resulting path gives the binding back. Those rules are what guarantee that matching and substitution reverse each other, and the loader enforces them on each pattern.
 
-A replica's identity is its site name followed by its fan-out bindings in brackets, such as `dest`, `dest[project=alpha]`, `dest[~/scripts/actors/.cursor/rules]`. The identity is the key under which the store records bases, so adding or removing a sibling replica leaves the others' records alone. The store also remembers the pattern behind each identity. When the pattern changes between runs, the replica is a different location under the same name: the daemon reports the change, drops the old records (or holds them while the gate is closed), and lets the replica start as a newcomer, so identical content aligns and differing content is held for a decision.
+### Derived properties
 
-To discover the keys of a relation, the daemon walks each replica from its root down to its depth and matches each regular file against the pattern. A file becomes a key when the constraints admit it and the ignore list does not exclude its tail. The daemon adds the keys it has records for, so a file deleted everywhere since the last cycle still comes up, is seen to be gone, and has its records cleared. When the current constraints no longer admit a recorded key, the daemon drops the key and its records from the relation. If the constraints are widened later, the file then starts from its present state instead of a stale basis.
+From each pattern the daemon derives four things:
 
-Walks skip symbolic links, the daemon's own temporary and marker files, and anything the ignore list excludes. Matching is case-sensitive. On a volume that ignores case, two keys differing only in case would land on one file; detecting that collision from the directory listing is listed as open work in todo.md.
-
-
-## Observation and transitions
-
-For each key the daemon reads one observation per replica. When the recorded modification time (to the millisecond) and size equal what the filesystem reports, the recorded hash is reused; otherwise the file is hashed. A path that is a directory, a link, or unreadable yields an unreadable observation with the reason.
-
-The transition at a replica follows from basis and observation:
-
-- no record and missing: unchanged
-- no record and present: appeared
-- tombstone and missing: unchanged
-- tombstone and present: recreated
-- snapshot and missing: disappeared
-- snapshot and present with the same hash: unchanged
-- snapshot and present with a different hash: edited
-- anything and unreadable: unreadable
-
-The daemon writes a tombstone only where a recorded snapshot went missing or where it deleted the file itself. A replica that lacked the file from the start keeps no record at all. So a tombstone marks a deletion at that replica.
-
-The first design had no rule for a file deleted and later recreated. Here the appeared and recreated transitions supply one. A file appearing where the daemon never recorded one conforms to its peers when any peer has a basis, since it is most likely a copy made by hand to bootstrap the location. A file appearing over a tombstone is treated as an edit, since the person deleted it there on purpose and then wrote a new one.
+- The root. This is the folder named by the leading segments that hold no variable. For `/a/pre{x}/f` the root is `/a`, since the segment `pre{x}` contains a variable. A pattern with no variables has its parent folder as its root. Walks start at the root.
+- The depth. This is how many segments a matching file has below the root, counting the file's own segment. Without a `{name...}` variable the depth is fixed. With a `{name...}` variable the depth is unbounded, with one exception: a glob constraint on that variable that contains no `**` and no bracket class such as `[abc]` spans a fixed number of segments, and the depth becomes fixed again. If several such globs constrain the same variable, the daemon uses the one that spans the fewest segments. A negated glob or a regular expression leaves the depth unbounded.
+- The footprint. This is the root, or the file itself when the pattern has no variables. The overlap check compares footprints. Two footprints overlap when they are equal or when one lies inside the other.
+- The tail. This is the part of a matched path below the root. The ignore globs from the configuration (see `ignore` under Top-level fields) are matched against the tail.
 
 
-## Flow and resolution
+## Sites, keys, and replicas
 
-The flow of a relation is written as statements separated by semicolons. Each statement relates a site or a braced set of sites to another through an arrow, with the kinds carried written in brackets:
+A relation declares its sites under `sites`. A site is a named role in the relation, such as `source` or `dest`. Flow statements refer to sites by these names. A relation must have at least two sites.
+
+### Locations
+
+A site is written in one of three forms:
+
+- As a single pattern. The site then has one location, with no label.
+- As a list of patterns. Each item is one location. Its label is the item text as written in the file, before `~` expansion.
+- As a map from labels to patterns. Each entry is one location, labeled with its key.
+
+An empty list or an empty map is an error. Two patterns under the same site that expand to the same text are an error as well, for example `~/x/` and `/Users/me/x/{path...}`.
+
+### Identity and fan-out variables
+
+The loader sorts the variables of a relation into two kinds.
+
+An identity variable appears in the pattern of each location of each site. The values of the identity variables form the key of a file. Two files at different sites belong together when their keys are equal. If a relation has no identity variables, it has a single key, the empty one. That is how a relation made of two plain paths, such as `/etc/nginx/conf.d/default.conf` and `~/backup/nginx.conf`, keeps two files with different names in sync as a pair.
+
+A fan-out variable is one you list under `fanout`. It may appear at some sites and not at others. At each location that uses it, the daemon creates a replica for each matching entry on disk.
+
+The loader reports an error in these cases:
+
+- A variable appears at some sites but not all, and it is not listed under `fanout`. The message suggests both repairs: add the variable to the other sites, or list it under `fanout`. If the variable is `path`, the message also suggests adding a trailing slash to the sites without it.
+- A `fanout` entry names a variable that no site uses.
+- A `fanout` entry names a variable that all sites use. Such a variable is part of the file identity.
+- A site has several locations, and one of them lacks an identity variable that the others have.
+- A fan-out variable is a `{name...}` variable, or comes after an identity variable in its pattern. Fan-out variables must match a single segment and come first, so that each replica has a fixed root.
+
+### Replicas
+
+A replica is a concrete location: a site, one of its locations, and a value for each fan-out variable in that location's pattern. The daemon expands the sites into replicas at the start of each cycle.
+
+A location without fan-out variables is a single replica. For a location with fan-out variables, the daemon walks down from the root. When it reaches the segment of a fan-out variable, it lists the folder and binds the variable to each entry whose name fits the segment and its constraints. If more segments follow, the entry must be a folder. Symbolic links and other special entries are skipped. The daemon continues below each binding in the same way. Each complete binding becomes a replica.
+
+If a folder is missing on the way to a fan-out variable, that location simply produces no replicas. If a folder exists but cannot be listed, the relation fails for this cycle and the daemon reports the error.
+
+The daemon pays no attention to fan-out values when it pairs files across sites. A file under `source[alpha]` and a file under `dest[beta]` belong together when their keys are equal, whatever the fan-out values are.
+
+### Replica identity
+
+Each replica has an identity string: the site name, then the label in brackets if there is one, then the fan-out values in brackets if there are any. Examples: `dest`, `dest[alpha]`, `dest[~/scripts/actors/.cursor/rules]`, `dest[project=alpha]`. The database stores all records for a replica under this identity. Adding or removing a sibling replica leaves the other replicas' records untouched.
+
+On the dashboard, in logs, and in hold reasons, the daemon shows a replica by its display name. When a site has a single replica, the display name is the site name alone. Otherwise it is the site name followed by the label or the fan-out values in parentheses, such as `dest (alpha)`.
+
+The database also stores the pattern behind each identity. If a replica shows up under a known identity but with a different pattern, the daemon reports a relocation and deletes the records stored under that identity. The replica then starts over with no records, and its files count as new. On that cycle the daemon evaluates each key of the relation, including the keys a normal cycle would skip (see Skipping settled keys). If a gate is closed, the database keeps the old pattern, the daemon reports the relocation on each cycle, and the records are deleted on the first cycle after the gate opens.
+
+A location in list form is labeled by its own pattern text. Editing that pattern creates a new identity, and the daemon sees a new replica instead of a relocation. The records under the old identity stay in the database until you remove them with `replica forget`.
+
+A replica whose identity is new to the database has no records. On the cycle where it first appears, the daemon evaluates each key of the relation. If a gate is closed on that cycle, the daemon does not record the identity, so the replica still counts as new on the next cycle.
+
+### Discovering keys
+
+For each replica, the daemon walks from the root down to the pattern's depth and matches each regular file against the pattern. A file becomes a key if it matches, its constraints hold, and no ignore glob matches its tail.
+
+During the walk the daemon skips folders beyond the depth, entries other than regular files and folders, and its own `.replica.tmp` marker files and `.replica-write` temporary files (both described under Applying a plan). Ignore globs apply to files only. A glob that matches a folder's tail does not stop the daemon from descending into that folder. If a subfolder cannot be read, the daemon reports a warning and skips it. If the root itself exists but cannot be read, the relation fails for this cycle.
+
+A missing root is handled in one of two ways. If the database holds snapshots for that replica, the daemon reports the relation as unavailable and leaves all replicas of the relation alone until the root is back. If the database holds no records for that replica, the daemon treats the root as a folder that has not been created yet, and the walk yields no keys.
+
+The database may hold records for keys the walk did not find. This happens when a file was deleted at all replicas since the last cycle. The daemon adds these keys to the keys found by the walk, so that it observes the deletion at each replica and clears the records.
+
+Finally, the daemon checks each key against each replica. It substitutes the key into the replica's pattern, then checks that the resulting path still matches the pattern and is not excluded by an ignore glob. If the check fails at any replica, the daemon drops the key and deletes the key's records. If you later loosen the constraints so that the file matches again, the daemon treats the file as if it had just appeared, with no record behind it.
+
+
+## Observing a key
+
+### Basis
+
+The basis is the record that the last commit stored in the database for a key at a replica. Commits are described under Applying a plan. The basis is one of:
+
+- A snapshot: the modification time, the size, and the BLAKE3 hash of the file's content.
+- A tombstone, meaning the file was deleted at this replica. The daemon writes a tombstone when it finds a recorded file missing, or when it deletes the file itself.
+- Nothing, when the database has no row for this key at this replica.
+
+### Observation
+
+For each key, the daemon looks at each replica and records one of:
+
+- Present, with a snapshot. If the basis is a snapshot with the same modification time (to the millisecond) and the same size as the file on disk, the daemon reuses the recorded hash. Otherwise it hashes the file. The record is rewritten only when the executor commits the key. Take a file whose modification time changed but whose content did not. Its hash still matches the record, so its transition is unchanged, and the daemon does not commit an unchanged key. The record keeps the old modification time, so the daemon hashes this file again on each cycle until some other change at the key leads to a commit.
+- Missing.
+- Unreadable, with the reason. Anything other than a regular file at the path counts as unreadable, and so does a failure to stat or read the path.
+
+### Transition
+
+Comparing the basis with the observation gives the transition at that replica:
+
+- no record, missing: unchanged
+- no record, present: appeared
+- tombstone, missing: unchanged
+- tombstone, present: recreated
+- snapshot, missing: disappeared
+- snapshot, present, same hash: unchanged
+- snapshot, present, different hash: edited
+- any basis, unreadable: unreadable
+
+
+## Flow and resolver
+
+### Flow statements
+
+The `flow` field holds one or more statements separated by semicolons. A statement has a site, or a braced set of sites, on each side of an arrow. After the right-hand side, a bracketed list names the kinds of change that pass along the arrow. The loader creates one edge for each pair of a left-hand site and a right-hand site.
 
     source <-> dest [edit create]
     source -> dest [edit create delete]
     {a, b} -> c [edit]
     backup <- source [all]
 
-An arrow without brackets carries `edit` and `create`. The keyword `all` stands for all three kinds. Edges compose transitively within a kind: under `a -> b [edit]; b -> c [edit]`, an edit made at `a` travels through `b` to `c`. A relation whose flow carries nothing is rejected at load, as is a statement mentioning an undeclared site.
+The kinds are `edit`, `create`, and `delete`. Separate them with spaces or commas. Empty brackets are an error. The loader also accepts `edits`, `change`, `changes`, `creates`, `creation`, `deletes`, and `deletion`. `all` means all three kinds. An arrow with no brackets carries `edit` and `create`. If two statements connect the same pair of sites in the same direction, the loader merges them into one edge that carries both sets of kinds.
 
-The daemon decides each key one replica at a time, applying the rules below. The code and the tests refer to the rules by these names.
+Each kind forms its own graph over the sites, and the daemon uses the transitive closure of that graph. Under `a -> b [edit]; b -> c [edit]`, an edit at `a` reaches `c`. Two replicas of the same site exchange changes only if the closure leads from the site back to itself, as it does under `a <-> b` or `a -> b; b -> a`. Under a one-way flow, the replicas of the upstream site are independent of each other.
 
-**Proposal.** An edited or recreated replica proposes its content. A replica whose file disappeared proposes a deletion. A replica where a file appeared proposes its content only if no replica of that key has a basis yet; if some peer already has one, the newcomer conforms to its peers instead. Unchanged and unreadable replicas propose nothing.
+A flow with no edges is an error at load time. So is a flow statement or resolver rule that names a site the relation does not declare.
 
-**Carriage.** A proposal travels along the edges of the kind that fits the target. New content travels along `edit` edges to a replica that has the file and along `create` edges to a replica that lacks it. A deletion travels along `delete` edges to a replica that has the file; nothing travels to a replica that lacks the file, since there is nothing to delete. When the target is unreadable, its state is unknown, so content may travel along either `edit` or `create` edges and a deletion along `delete` edges. A proposal may pass through intermediate sites, because the daemon uses the transitive closure of each kind's edges.
+### Resolver rules
 
-**Candidates.** The candidates for a target are the proposals that travel to it from other replicas. If the target has a proposal of its own, and that proposal could travel back to at least one of the candidates' replicas, the target's proposal joins the candidates. This is how a two-way edge produces a conflict when both ends change, while a one-way edge lets the upstream content overwrite a downstream edit: the downstream proposal has no edge back upstream, so it drops out of the competition.
+The `resolve` field holds rules separated by semicolons. When the changes arriving at a replica disagree, the daemon tries the rules in order (see the Resolve rule under Deciding a key):
 
-**Reversion.** Suppose no proposal travels to the target. If the target has a proposal of its own that can travel somewhere else, the daemon leaves the target alone and lets the proposal go. Otherwise the daemon looks at the target's settled peers, meaning the replicas that still match their recorded snapshot and still have the file. Each settled peer whose content could travel to the target under the carriage rule becomes a candidate. In practice this restores a deleted file over an incoming `create` edge, fills an empty replica from an unchanged one, and undoes a downstream edit that has no edge to leave by.
+- `a > b` prefers content from site `a` over content from site `b`. `a < b` prefers `b`. Either side may be a braced set of sites. A rule with the same site on both sides, such as `a > a` or `{a, b} > {a, c}`, is an error.
+- `a mtime b` prefers the newer file. `a size b` prefers the larger file. `a name b` prefers the file whose name sorts first in byte order, so uppercase letters sort before lowercase ones. `newer` and `larger` are synonyms for `mtime` and `size`. On a tie, the daemon moves to the next rule.
+- A bare property, such as `size`, compares any pair of sites. A property rule that names the same site twice, such as `a mtime a`, compares only the replicas of that site. Use either form to decide between replicas of one site.
 
-**Resolution.** When the candidates agree on one content (or on absence), the target takes it. Otherwise the resolver rules are tried in order. A rule `a > b` prefers a candidate from site `a` over one from site `b`. A rule of the form `a mtime b`, `a size b`, or `a name b` compares the two properties and prefers the greater (newer, larger, alphabetically earlier name); a tie falls through to the next rule. A bare property applies to all pairs. Under a property rule a present file beats an absence. A candidate beating all candidates of differing content wins. When no rule decides, the daemon holds the target with a conflict reason, keeps its basis as it was, and reports the conflict.
-
-**Unreadable peers.** An unreadable replica is held, with the read error as its reason. Any other replica whose proposal could travel to the unreadable one is held as well, because the daemon cannot tell whether the unreadable peer holds a competing change. A held replica keeps its recorded basis, so its edit or deletion is still pending when the peer becomes readable again.
-
-**Operation.** Once a target's desired state is known, the operation follows: a write when the target has the file with different content, a create when it lacks the file, a delete when it has the file and the decision was absence, nothing when it already matches.
-
-**Commitment.** After the plan applies, the daemon records a new basis for each replica it did not hold: the snapshot it wrote, a tombstone where it deleted the file or where a recorded snapshot was found missing, or the observed snapshot where nothing changed. A replica that had no record and still has no file keeps no record. Held replicas keep their old basis and are marked unresolved with their reason. While a key has an unresolved mark, the daemon evaluates it fully on each cycle even when nothing on disk changes, so a standing conflict stays visible.
-
-**Forgetting.** When a key is missing at all of its replicas, the daemon clears its records, so a later file with the same name starts from nothing.
-
-Under these rules the scenarios from the first design's tests come out the same way:
-
-- A unilateral edit wins regardless of timestamps.
-- Concurrent differing edits are held when no rule applies, or settled by `mtime` or precedence when a rule does.
-- A one-way edge overwrites downstream edits silently.
-- Three sites conflict only where their paths meet.
-- Chains propagate transitively.
-- Convergent edits commit with no operation.
-- A late joiner conforms.
-- A first run seeds identical content and contests differing content.
-- Creation needs a `create` edge.
-- A deletion propagates along `delete` edges or is restored through `create` edges.
-- An edit against a deletion is held unless a rule decides; under `mtime` the file beats the absence.
-- A mirror overwrites downstream changes and fans out.
-- Replicas of a single site sync through a cycle in the flow.
-
-Because each target's candidates are computed from the observations alone, the order in which the daemon visits the replicas does not affect the outcome.
+Under a property rule, a present file beats an absent one. The `resolve` field is optional. If it is missing, or if no rule decides a pair, the daemon holds the replica with a conflict reason and waits for a person to resolve it.
 
 
-## Plans and execution
+## Deciding a key
 
-An assignment says, for each replica, which content hash it should hold or that it should be absent. The executor turns that into writes in stages; a failure at any stage stops the later ones from running:
+The daemon decides each replica of a key from the bases and observations of all replicas of that key, together with the relation's flow and resolver. The decision made for one replica plays no part in the decision for another, so the order in which the daemon visits the replicas does not matter. The rules below carry the names used in `src/decide.rs`.
 
-1. **Staging.** For each hash the plan needs, the executor finds a replica that was observed with that hash, reads the file once through the medium, hashes it as it goes, and stores it in the blob store under its hash. If the recomputed hash differs from the observed one, the file changed under the daemon and the plan aborts. If no replica holds the hash (because it is a transform output, or because the replica changed during the cycle), the executor looks in the blob store; if the blob store lacks it too, the plan aborts. Since the bytes come out of the blob store rather than from a donor path, a plan may safely overwrite a replica even when its previous content is on its way to another replica.
-2. **Archiving.** The executor reads each present target about to receive different content or absence into the blob store, then writes an archive row recording which relation, key, replica, and path the content came from, along with its hash, its size, the reason for archiving, and the time. A failure here aborts the plan, so no content is destroyed unarchived.
-3. **Journaling.** An intent row records the plan under its relation and key. Beside each file about to be created or deleted, the executor places a marker file named after the target plus `.replica.tmp`. The marker states the process id, relation, key, replica, operation, and start time, together with a note that it disappears once the operation commits.
-4. **Writing.** Each write streams the blob to a temporary file in the target directory, applies the mode and modification time, syncs, renames over the target, syncs the directory. When times are synced, the modification time comes from the replica that proposed the content. A new file takes that replica's permission bits; an overwritten file keeps its own. Each delete removes the target, treating an already-absent target as done.
-5. **Committing.** In a single transaction the executor replaces the records of unheld replicas with their outcomes, marks held replicas unresolved, and removes the intent row. It then removes the markers and any staged blob without an archive row.
+1. Voice. Each replica makes at most one proposal, based on its transition. An edited or recreated replica proposes its content. A disappeared replica proposes absence. An appeared replica proposes its content only if no replica of the key has any record, neither snapshot nor tombstone. Otherwise the newcomer proposes nothing and conforms to its peers under the Conform rule below. Unchanged and unreadable replicas propose nothing.
 
-When a stage fails, the executor removes the markers and the intent row, leaves the records as they were, and reports the error along with the operation and the path, so the next cycle plans again from the last consistent basis. An intent row found at startup means a previous run died mid-plan; the daemon reports it as an unfinished operation, shows it on the dashboard for the life of the process, and reconciles its key from scratch.
+2. Admit. A proposal travels from a source replica to a target replica when the transitive closure of the flow, for a suitable kind, has an edge from the source site to the target site. The suitable kind depends on the target's observation:
+    - content to a present target: `edit`
+    - content to a missing target: `create`
+    - absence to a present target: `delete`
+    - content to an unreadable target: `edit` or `create`
+    - absence to an unreadable target: `delete`
+    - absence to a missing target: nothing travels
 
-While the store exceeds its cap, the blob store evicts the oldest archived revisions of the relation holding the most bytes; the revision just written is exempt. Once the last archive row pointing at a blob is gone, the blob is removed from disk.
+3. Hold. An unreadable replica is held with the reason `unreadable: <error>`. A replica whose proposal travels to an unreadable peer is held too, with the reason `waiting on <replica>: unreadable`, since that peer might hold a competing change. A held replica keeps its basis, so its change stays pending until the peer becomes readable.
+
+4. Contest. The candidates for a target are the proposals that travel to it from readable peers. Suppose at least one candidate has arrived. If the flow also lets the target's own proposal reach at least one of the peers that sent a candidate, the daemon adds the target's proposal to the candidates. On a two-way edge, each end's proposal is a candidate at the other end. If the two contents differ, the resolver rules pick one. If the two contents are identical, both ends already agree, and no operation results. On a one-way edge, the downstream proposal has no edge back, so the upstream content overwrites the downstream edit.
+
+5. Stand. If no candidate arrives and the target's own proposal travels to some peer, the target keeps its state. Its proposal is handled at the peers that receive it.
+
+6. Conform. If no candidate arrives and the target has no proposal that travels anywhere, the daemon looks at the target's settled peers, meaning the replicas that are present on disk and unchanged against a recorded snapshot. Each settled peer whose content can travel to the target under the Admit rule becomes a candidate. This is how a deleted file is restored through an incoming `create` edge, how a newcomer is filled from an unchanged peer, and how a downstream edit with no outgoing edge is reverted. If there are still no candidates, the target keeps its state.
+
+7. Resolve. If all candidates agree on one content, or all propose absence, the target takes that. Otherwise the daemon applies the resolver rules to each pair of disagreeing candidates. A candidate that beats each candidate with different content wins. If none wins, the daemon holds the target with the reason `conflict: <replica> vs <replica> (no rule decides)`, naming all candidates. The target keeps its basis.
+
+8. Operation. Each unheld replica now has a desired state: keep, a content hash taken from a named replica, or absence. The operation follows from the desired state and the observation. A missing target, or a present target with different content, gets a write. A present target whose desired state is absence gets a delete. Anything else is left alone.
+
+When the daemon reports a hold reason, the report starts with the display name of the held replica, followed by the reason.
+
+After the plan has been applied, the executor commits a new basis for each unheld replica. This happens even when the plan contained no operations. The new basis is:
+
+- for a file the executor wrote: the new snapshot
+- for a file the executor deleted, or a recorded file found missing: a tombstone
+- for a present file that was left alone: the observed snapshot
+- for a missing file that had no record or a tombstone: the old basis, unchanged
+
+Each held replica is marked unresolved, together with its reason. While a key has an unresolved mark, the daemon evaluates it on each cycle, even when nothing on disk changes, so a standing conflict stays visible.
+
+If a key is missing at all of its replicas, the daemon does not run the rules above for it. Unless a gate is closed, the daemon deletes the key's records right away. A file that later appears under the same key starts with no record.
 
 
-## State
+## Applying a plan
 
-The state database is SQLite in write-ahead mode, in the state directory. Its tables:
+The executor applies a plan in stages. If a stage fails, the later stages do not run.
 
-- `setting`: schema version, persisted gate flags (global and per relation), persisted pause flag.
-- `relation`: name, policy fingerprint. When the fingerprint of a loaded relation differs from the stored one, the next cycle evaluates each key of the relation instead of skipping settled ones, then stores the new fingerprint.
-- `replica`: relation, replica identity, path last seen, first seen time.
-- `record`: relation, key, replica, state (absent or present), mtime, size, hash.
-- `unresolved`: relation, key, replica, reason.
-- `intent`: relation, key, plan text, started time.
-- `archive`: id, relation, key, replica, path, hash, size, reason, time.
+1. Staging. For each write in the plan, the executor makes sure the blob store holds the content. If the store already has the blob, nothing is read. Otherwise the executor reads the file at the replica named as the source, hashing it as it reads, and stores the bytes under their hash. If the hash comes out different from the observed one, the file changed during the cycle. The executor then tries each other replica observed with the same hash, and aborts the plan only if none of them still holds that content. If a transform is configured for the edge (see Actions and transforms), it runs here against the staged blob. Writes read from the blob store, and from nowhere else. This is why the executor can overwrite a replica even when another replica is about to receive that replica's old content: the old content was staged as a blob first.
 
-The schema version is 2. The daemon refuses a database written by the first design, since its replica identities and record states do not carry over; the message says which file was refused and which two versions are involved. The operator starts a fresh state directory. The first cycle then behaves as a first run: it aligns identical content and holds differing content for a decision.
+2. Archiving. For each present target that is about to receive different content or be deleted, the executor copies the current file into the blob store, hashing as it copies, and writes an archive row: relation, key, replica, path, hash, size, reason (`overwritten` or `deleted`), and time. If the hash differs from the observed snapshot, the target changed during the cycle and the plan aborts. A target that has vanished since the observation is skipped without a row. Because this stage runs before any write, nothing is destroyed without an archived copy.
 
-Gate state is read from the database at startup and combined with the configuration so that the gate is closed when either says closed. When the operator opens a gate from the dashboard, the daemon stores the open state, so it survives a restart unless the configuration says to start closed.
+3. Journaling. If the plan contains at least one operation, the executor writes an intent row for the key, describing the operations. For each file about to be created or deleted, the executor creates a marker file in the target's folder, named after the target with `.replica.tmp` appended. An overwrite of an existing file gets no marker, since the rename in the next stage is atomic. The marker records the process id, relation, key, replica, operation, and start time, plus a note saying that the marker disappears once the operation commits. A plan with no operations skips this stage and the next and goes straight to the commit.
+
+4. Writing. For each write, the executor creates any missing parent folders, creates a temporary file named `.<file>.replica-write` in the target folder, sets its permission bits while it is still empty, streams the blob into it, sets the modification time, syncs the file, renames it over the target, and syncs the folder. Some filesystems refuse the folder sync, and the executor ignores that refusal. With `sync_times` on, the modification time is copied from the replica that supplied the content. A newly created file gets that replica's permission bits. An overwritten file keeps its own. If the bits cannot be set, the write still succeeds and the executor reports a warning. For each delete, the executor removes the target, and treats an already missing target as removed. If a file name plus suffix would exceed 255 bytes, the executor uses the first 16 hex characters of the BLAKE3 hash of the name in place of the name, both for the marker and for the temporary file.
+
+5. Committing. In one transaction, the executor writes the new basis of each unheld replica, marks the held replicas unresolved, clears old unresolved marks on the others, and deletes the intent row. Then it removes the markers and any staged blob that no archive row refers to.
+
+If a stage fails, the executor removes the markers and the intent row, leaves the records untouched, and returns the error along with the operation and the path. The next cycle plans the key again from the last consistent basis. If the commit stage itself fails, the files already written and deleted stay as they are, and the next cycle sees them as changes and plans the key from there.
+
+An intent row found at startup means that a previous process died in the middle of a plan. The daemon reports it as a stale intent, shows it on the dashboard for the life of the process, deletes the row, and removes any `.staging-` files from the blob folder. Markers and `.replica-write` files left in the target folders stay where they are, and the key walk skips them. The daemon then handles the key like any other, from its observations.
+
+### Archive eviction
+
+After each archive write, the blob store checks its cap. While the archived blobs together exceed the cap, the store picks the relation with the most archived bytes and deletes that relation's oldest archive row. The row just written is exempt, so a single revision larger than the cap stays. A blob with no remaining archive rows is deleted from disk. Evicted revisions disappear from the history page along with their rows. A row whose blob is missing from disk shows `evicted` in place of its download link.
+
+
+## State folder
+
+The daemon creates the `state` folder if it is missing, creates `blobs/` the first time it stages content, and creates the parent folder of each log file at startup. The folder holds:
+
+- `state.db`, the SQLite database, in write-ahead mode.
+- `blobs/`, the blob store. Each blob is a file named by the hex of its BLAKE3 hash, readable only by the owner. The store writes bytes to a temporary file named `.staging-<pid>-<n>` and renames it into place, so any blob found under its final name is complete. Leftover `.staging-` files are removed at startup.
+- `replica.lock`, the lock file. At startup, before opening the database or serving the dashboard, the daemon creates this file and takes an exclusive lock on it. A second daemon pointed at the same folder finds the lock taken, prints the state folder and the lock path, and exits with status 2.
+- The log files, if the relations' `log` paths point here.
+
+### Tables
+
+- `setting`: `key` and `value`. The schema version is stored under `schema_version`. Gate flags are stored under `gate` and `gate.<relation>`, with the value `true` or `false`.
+- `relation`: `name`, `fingerprint`.
+- `replica`: `rel`, `id` (the replica identity), `path` (the pattern text), `seen` (when the daemon last noted the replica, rewritten on each cycle).
+- `record`: `rel`, `key`, `replica`, `present`, `mtime`, `size`, `hash`. A row with `present` 0 is a tombstone, and its other columns are null. `key` holds the canonical key text. Times are milliseconds since the Unix epoch. Hashes are 32-byte blobs.
+- `unresolved`: `rel`, `key`, `replica`, `reason`.
+- `intent`: `rel`, `key`, `detail` (the plan text), `started`.
+- `archive`: `id`, `rel`, `key`, `replica`, `path`, `hash`, `size`, `reason`, `at`.
+
+### Schema version and first run
+
+The schema version is 2. If the database has a different version, the daemon refuses to open it and names the file and both versions. Start a fresh state folder in that case.
+
+The first cycle against a fresh state folder behaves as a first run. No replica has a record, so each present replica proposes its content under the Voice rule. Where the copies are identical, the daemon stores a snapshot of each copy as its basis and changes no file. Where they differ, the resolver rules decide, and the daemon holds the key with a conflict reason only if no rule applies.
+
+### Policy fingerprint
+
+The fingerprint of a relation covers its site names, the pattern text and constraints of each location, the flow and resolver text, the combined ignore list (the top-level globs followed by the relation's own), and the transform commands. When the fingerprint of a loaded relation differs from the stored one, the daemon evaluates each key of that relation on each cycle instead of skipping settled keys. It does this under a closed gate too. The first cycle with the gate open stores the new fingerprint.
+
+
+## Cycles and triggers
+
+### Schedule and watch
+
+The daemon runs a full cycle over all relations as soon as it starts. After that, each full cycle begins `interval` after the previous one ended.
+
+With `watch` on, the daemon asks the operating system (through the `notify` crate) to report changes under the root of each replica and under the root of each fan-out pattern. When a change is reported, the daemon marks dirty each relation whose registered root contains the changed path. Once `debounce` has passed with no further reports, the daemon runs an early cycle, that is, a cycle over the dirty relations only. The scheduled full cycle still runs at `interval`, so a lost or merged report delays a sync by at most one interval. The daemon's own writes are reported too, but the next cycle finds those files matching their bases and does nothing. A relation with `watch: false` relies on the schedule alone.
+
+If a root does not exist at startup, the watcher does not register it, and nothing registers it later in the run. Until the daemon restarts, it learns of changes under that root from the scheduled cycle only. If the watcher cannot start at all, the daemon prints `watch: disabled` with the reason and runs on the schedule. If the operating system refuses one root, the daemon prints a message and leaves that root unregistered.
+
+### Skipping settled keys
+
+Within a cycle, the daemon skips a key when all of its replicas match their bases. It still evaluates such a key if the key has an unresolved mark, if the relation's fingerprint has changed, or if a replica of the relation is new to the database or has relocated since the last cycle.
+
+### Reporting persisting conditions
+
+A condition that persists across cycles, such as a conflict, is reported when it first appears and again whenever it changes. The cycles in between stay quiet. Once the condition clears, its next appearance is reported again. The daemon keeps this bookkeeping in memory, so after a restart it reports each standing condition once more.
+
+### Control requests
+
+The dashboard and the command line send control requests to the daemon:
+
+- `pause` stops both the scheduled cycles and the early cycles that change reports trigger.
+- `resume` runs a cycle at once and restores the schedule.
+- `sync` runs a full cycle over all relations at once, even while paused. A paused daemon stays paused afterwards.
+- `restart` first checks that the configuration file still loads. If it does not, the daemon refuses the restart and keeps running with its current configuration. Otherwise the daemon finishes the key it is applying, exits with status 1, and launchd starts it again.
+- `halt` makes the daemon finish the key it is applying and exit with status 0. SIGTERM and SIGINT have the same effect.
+
+### Gate persistence
+
+Each gate is stored as a flag in the `setting` table. A flag of `true` means closed. At startup, a gate starts closed if either its stored flag or the configuration says closed. An open flag in the database does not open a gate that the configuration closes.
+
+Opening or closing a gate from the dashboard or the command line writes the flag, so the gate keeps its state across restarts. `gate: true` at the top level, or the `--gate` option, does more than close the global gate at startup: it also writes `true` to the global flag, so later runs start closed too, until someone opens the gate. A relation's own `gate: true` closes that relation's gate at startup without writing its flag. If you remove it from the configuration, that gate opens on the next start, unless someone closed the gate by hand in the meantime.
+
+A gate changed from the dashboard takes effect immediately for cycles that have not started yet. A cycle already running reads each relation's gate once, just before visiting that relation's keys, so it picks up the change at the next relation. The flag is written to the database once the running cycle ends.
 
 
 ## Configuration
 
-The configuration is YAML. Its top level:
+The configuration is a YAML file. The loader honors YAML merge keys (`<<`). It rejects any field outside the lists below, whether at the top level, inside `archive` or `dashboard`, inside a relation or a profile, or inside a command map.
 
-    state: ~/scripts/replica/live
-    interval: 1m
-    watch: true
-    gate: false
-    ignore: ["**/.DS_Store"]
-    archive: { cap: 100MB }
-    dashboard: { port: 18516, recent_events: 200, refresh: 10 }
-    include: ["relations/*.yaml"]
-    vars: { ... }
-    profiles: { ... }
-    relations: { ... }
+All paths must be absolute or start with `~`, because the daemon's working directory under launchd is `/`. The one exception is an `include` entry, which the loader resolves relative to the configuration file.
 
-`state` is the directory holding the database, the blob store, and the logs. Each path must be absolute or start with `~`, since the daemon's working directory under launchd is `/`.
+### Top-level fields
 
-**Variables** are written `${name}` and are expanded in each string of the file after includes are merged: paths, patterns, flow statements, action commands, log paths. This expansion leaves path variables in braces alone, so `{name}` and `${name}` can share a name without interfering. Inside a relation, `${relation}` is bound to the relation's name, then the top-level `vars`, then the relation's own `vars`, each layer overriding the one before. The loader rejects a reference to an undefined variable, quoting the string and the variable name in the message. A cycle among variables is an error.
+- `state`: the state folder. The `run`, `plan`, and `forget` subcommands need it. `check` and `explain` work without it.
+- `interval`: time between scheduled cycles. Default `30s`. Units are `ms`, `s`, `m`, and `h`. A bare number means seconds. Zero is an error. `debounce` and each command `timeout` use the same format.
+- `watch`: whether to register for filesystem change reports. Default `true`.
+- `debounce`: how long to wait after a change report before the early cycle. Default `2s`.
+- `gate`: whether the global gate starts closed. Default `false`. The `--gate` option of `run` has the same effect.
+- `ignore`: globs matched against the tail of a path. A matching file is left out of all relations. `*` matches within one segment.
+- `archive`: a map with `cap`, the size limit of the archive. Default `100MB`. Units are `B`, `KB`, `MB`, `GB`, `TB`, or their first letters, in any letter case, as binary multiples. Decimals are allowed. A bare number means bytes.
+- `dashboard`: a map with `port` (required), `recent_events` (default 200), and `refresh`, the seconds between page refreshes (default 10). Without this field there is no dashboard, and the control subcommands have nothing to connect to.
+- `include`: a list of files or globs. A relative entry is resolved against the folder of the configuration file. An absolute entry, or one starting with `~`, is used as is. A wildcard may appear only in the file name. A glob picks up the regular files of its folder in name order and may match nothing. A literal path to a missing file is an error. An included file has the same form as the main file. The loader takes `vars`, `profiles`, `relations`, and `ignore` from it. The loader rejects the file if it sets `state`, `interval`, `dashboard`, or `include`. The loader ignores `watch`, `debounce`, `gate`, and `archive` if the file sets them. The included entries merge into the main file's. If a variable, profile, or relation is defined twice, the loader reports an error naming the main file and the included file with the later definition.
+- `vars`: configuration variables.
+- `profiles`: bundles of relation fields.
+- `relations`: the relations, by name.
 
-**Profiles** are named bundles of relation fields. A relation lists one or more profiles under `profile`. The loader assembles the relation by deep-merging, in order, the profile named `_` if there is one, then each listed profile, then the relation's own body. In a deep merge, a later map adds or replaces keys inside an earlier map, while a later list or scalar replaces the earlier value outright. A profile may itself list profiles. The loader rejects a reference to an undefined profile. An unknown field is an error wherever it appears, including inside a profile; the message says which profile or relation holds it.
+### Profiles
 
-**Includes** are files or globs, resolved relative to the including file. An included file has the same top-level form as the main file, except that it may not include further files or set `state`, `interval`, or `dashboard`. Its vars, profiles, and relations merge into the main file's. A name defined in two files is an error whose message quotes both file names.
+A profile is a named map of relation fields. A relation lists its profiles under `profile`, as a name or a list of names. The loader builds the relation by deep-merging, in this order: the profile named `_` if there is one, then each listed profile, then the relation's own body. In a deep merge, a later mapping adds its new keys to the earlier mapping. Where both mappings have the same key, the loader merges the two values by this same rule. A later list or scalar replaces the earlier value outright. A profile may itself list profiles, and the loader merges those first. A profile chain that loops back on itself is an error. An unknown field inside a profile is an error, and the message names the profile.
 
-A **relation** has these fields:
+### Variables
+
+A configuration variable is written `${name}`. After the loader has merged a relation's profiles, it expands variable references in each string of that relation, in mapping keys as well as values. This covers site names, location labels, paths, patterns, flow and resolver text, commands, transform edges, and log paths. Path variables in plain braces, such as `{name}`, belong to patterns and are left alone, so a path variable and a configuration variable may share a name.
+
+The loader builds the scope of a relation in layers, each layer overriding the one before:
+
+1. The top-level `vars`. `${state}` is set to the state folder unless `vars` defines it.
+2. `${relation}`, set to the relation's name. For a relation stamped out by `each`, this is the copy's name.
+3. The `each` values of this copy.
+4. The relation's own `vars`, read after the profiles are merged, so a profile may supply them.
+
+A value may refer to other variables. An undefined reference, a circular reference, or an unclosed `${` is an error, and the message quotes the string and the variable. Inside `on` and `transform` commands, unknown references are left as written, because the daemon fills them in when the command runs.
+
+### Relation fields
 
     sites:
         source: ~/Desktop/mylibrary/
         dest: ~/scripts/desktop-library/
     where: { path: "*.js" }
+    fanout: [project]
     flow: "source <-> dest [edit create]"
     resolve: "source mtime dest"
-    fanout: [project]
     ignore: ["*.tmp"]
     sync_times: true
     gate: false
     watch: true
     log: ${state}/logs/${relation}.log
+    profile: two-way
+    vars: { ... }
+    each: { ... }
     on: { ... }
     transform: { ... }
-    each: { ... }
 
-`sites` maps each site name to a pattern, a list of patterns, or a map from replica names to patterns. `where` constrains variables. `fanout` lists the variables that fan a site out into replicas; a fan-out variable must match a single segment and must come before the identity variables of its pattern, so each replica has a fixed root. `flow` and `resolve` are described above. `each` stamps the relation out once per combination of the listed values. Each copy is called `name-value`, with the value available to it as a variable. This is for several independent relations that share a form but need their own gates, logs, and histories.
+- `sites`: see Sites, keys, and replicas.
+- `where`: constraints by variable, see Patterns.
+- `fanout`: the fan-out variables.
+- `flow`, `resolve`: see Flow and resolver. `resolve` is optional. A relation without rules holds each disagreement as a conflict.
+- `ignore`: globs added to the top-level list for this relation.
+- `sync_times`: copy the modification time along with the content. Default `true`.
+- `gate`: start this relation's gate closed. Default `false`.
+- `watch`: register this relation's roots for change reports. Default `true`.
+- `log`: a file that receives the relation's events, one per line. Its path is reserved, so no root may contain it.
+- `profile`, `vars`: see above.
+- `each`: a map from variable names to non-empty lists of values. The loader reads it from the relation's own body and ignores it inside a profile. It creates a copy of the relation for each combination of values, named `<relation>-<value>...` with the values in variable-name order, and gives each copy its values as variables. Use this for several independent relations that share a form but need their own gates, logs, and histories.
+- `on`, `transform`: see Actions and transforms.
 
-The loader checks the following, in order, and reports the first failure together with the relation, site, field, and offending text:
+### Validation
 
-- each path is absolute;
-- each pattern is well formed under the restrictions in the patterns section;
-- each variable constraint is a valid glob or regular expression;
-- each variable either appears on all sites or is listed under `fanout`; when a variable appears on some sites but not others, the error suggests both fixes, adding it to the remaining sites or listing it as fan-out;
-- each fan-out variable matches a single segment and comes before the identity variables of its pattern;
-- each site in `flow` and `resolve` is declared;
-- `flow` has at least one edge;
-- no two relations share a name after `each` expansion;
-- no footprint overlaps another footprint or a reserved path.
+The loader checks each relation and reports the first problem it finds, together with the relation, site, field, and offending text. It checks that:
 
-The example configuration and the live configuration are rewritten in this form in `config.example.yaml` and in the operator's `config.yaml`.
+- each path is absolute or starts with `~`
+- each pattern follows the syntax rules
+- each constraint is a valid glob or regular expression, and each `where` entry names a variable that some site uses
+- each variable is either an identity variable or a declared fan-out variable
+- each fan-out variable matches a single segment and comes before the identity variables of its pattern
+- at least two sites are declared
+- `flow` has at least one edge, and `flow`, `resolve`, and `transform` name only declared sites
+- the receiving site of a transform has no outgoing edges
+- each command is non-empty, and its timeout parses when given
+- each `on` key is one of `changed`, `resolved`, `held`, `conflict`, `error`
+- each `transform` key has the form `from -> to`
+- no two relations share a name after `each` expansion
+
+At startup, the daemon also refuses to run if any footprint overlaps the state folder or a log file. At the start of each cycle, the daemon checks the footprints of all replicas against each other and against those reserved paths. Any relation involved in an overlap is skipped for that cycle and reported. This per-cycle check is what catches a fan-out replica that appears after startup.
 
 
-## Triggers and actions
+## Actions and transforms
 
-**Watching.** With `watch: true`, the daemon registers the root of each replica and the directory of each fan-out variable with the operating system's change notification facility through the `notify` crate. An event under a root marks the relation dirty. After a quiet period (`debounce`, default two seconds) the main loop runs a cycle over the dirty relations alone, then resumes the schedule. The daemon's own writes arrive as events too; the following cycle finds them matching the basis and does nothing. A relation may set `watch: false` to stay on the schedule alone. The scheduled cycle still runs at `interval` and still decides what is correct, so a lost or coalesced event delays a sync by at most one interval.
+### Actions
 
-**Actions.** The `on` block of a relation maps event kinds to commands:
+The `on` block maps event kinds to shell commands:
 
     on:
         changed: "make -C ~/scripts/site"
         resolved: "scp ${path} host:backup/${relation}/"
         conflict: "osascript -e 'display notification \"${key}\" with title \"replica conflict\"'"
-        error: "..."
+        error: { run: "...", timeout: 5m }
 
-The kinds are `changed`, `resolved`, `held`, `conflict`, and `error`. A `changed` action runs once per cycle in which at least one plan of the relation applied. A `resolved` action runs once per key whose plan applied. For each replica that was written, the command has `${key}`, `${path}`, `${replica}`, `${site}`, and `${op}` filled in. The daemon runs a command through `sh -c` with the state directory as its working directory. The command inherits the daemon's environment with `REPLICA_RELATION`, `REPLICA_KEY`, and `REPLICA_EVENT` added. It is killed after a minute unless the action sets its own `timeout`. The last line of the command's output is carried in the action event, which the relation's log records. A nonzero exit or a timeout is reported as a failed action; the cycle's own outcome is unaffected. An action that writes into a replica of its own relation causes a transition at the next cycle like any outside edit; an idempotent action converges after one extra cycle, since the daemon finds the rewritten file unchanged by hash.
+A command is either a string or a map with `run` and `timeout`. `timeout` uses the same duration format as `interval` and defaults to one minute.
 
-**Transforms.** The `transform` block maps an edge to a command:
+The event kinds, and the variables each one provides:
+
+- `changed` runs once per cycle in which the relation applied at least one operation, after that cycle's `resolved` actions. Variables: `ops`, the number of operations the relation applied in the cycle.
+- `resolved` runs once for each operation applied. Variables: `key`, `path`, `replica`, `site`, `op` (`write` or `delete`), and `plan`.
+- `held` runs while a gate is holding a plan that has at least one operation. It runs only when something differs from the last report: the plan itself, the hold reasons, or the observed content at some replica. Variables: `key` and `plan`.
+- `conflict` runs after a cycle with the gate open leaves a key with held replicas, provided the hold reasons differ from those in the last report. It does not run while the gate is closed. Variables: `key`, and `reason`, a list of the held replicas, each written `<replica>: <reason>` and separated by `; `.
+- `error` runs when inspecting, deciding, or applying one key fails, and the error differs from the last report. A failure of the whole relation, such as an expansion failure, an overlap, or an unreadable root, produces an error event but runs no action. Variables: `key` and `error`.
+
+`${relation}` is available in each kind. The daemon substitutes the variables into the command text and runs it with `sh -c`, with the state folder as the working directory and standard input closed. The environment is the daemon's own, plus `REPLICA_<NAME>` for each variable (upper case) and `REPLICA_EVENT` holding the kind. The daemon waits for the command, so the cycle pauses for as long as the command runs, up to the timeout, at which point the daemon kills it. The resulting action event records the expanded command, its exit status (or a note that it timed out), and the last line of its output, where the output is standard output followed by standard error. The relation's log receives this event. A nonzero exit or a timeout is reported as a failed action, but it does not change the outcome of the cycle.
+
+An action that writes into a replica of its own relation causes a transition on the next cycle, like any outside edit. If the action is idempotent, the daemon finds the rewritten file unchanged by hash and the relation settles after one extra cycle.
+
+### Transforms
+
+The `transform` block maps an edge, written `from -> to`, to a command. The command takes the same string-or-map form as an action and has the same default timeout.
 
     transform:
-        "source -> site": "sassc ${in} ${out}"
+        "src -> out": "sassc ${in} ${out}"
 
-While content travels along that edge, the executor stages the sender's blob, runs the command with `${in}` bound to the blob path and `${out}` to a temporary path, hashes the output, stores it as a blob, and assigns that hash to the receiver. The receiver's basis records the output hash, so it reads as unchanged next cycle. A site fed through a transform must not have outgoing edges, since there is no way to map its content back. The loader rejects a flow that gives it one. A failing or timed-out command fails the plan for that key; the error is reported and the key is planned again on the next cycle. A command whose output varies between runs causes no churn, since the transform runs only when the sender's transition calls for it.
+The executor applies a transform to each write whose content comes from a replica of the `from` site and goes to a replica of the `to` site. The `from` site is the site of the replica that supplied the winning content. As a result, a transform on `b -> c` does not apply to content that `a` sends to `c` through the closure, and a fan-in such as `{a, b} -> out` needs one entry per supplying site.
+
+The executor runs the command during staging, with `sh -c` and the state folder as the working directory. `${in}` is the path of the sender's blob in the blob store. `${out}` is a path inside the blob folder that does not exist when the command starts. The environment is the daemon's own plus `REPLICA_IN` and `REPLICA_OUT`. After the command finishes, the executor hashes the file the command wrote to `${out}`, stores a copy in the blob store under that hash, deletes the file at `${out}`, and uses the hash as the receiver's content. The receiver's basis records that hash, so the file reads as unchanged on the next cycle. If the command exits nonzero, times out, or writes nothing to `${out}`, the plan for that key fails, and the daemon plans the key again on the next cycle.
+
+The loader rejects a flow in which the receiving site of a transform has an outgoing edge, because transformed content cannot be mapped back to the sender's form.
 
 
 ## Interfaces
 
-**Command line.** The binary takes a subcommand:
+### Command line
 
     replica run --config PATH [--once] [--gate]
     replica check --config PATH
     replica explain --config PATH [RELATION]
     replica plan --config PATH [RELATION]
-    replica status [--port N] [--json]
-    replica sync | pause | resume | restart | halt [--port N]
-    replica gate open|closed [--relation NAME] [--port N]
-    replica history RELATION [--port N] [--json]
+    replica status (--port N | --config PATH) [--json]
+    replica sync | pause | resume | restart | halt (--port N | --config PATH)
+    replica gate open|closed [--relation NAME] (--port N | --config PATH)
+    replica history RELATION (--port N | --config PATH) [--json]
     replica forget --config PATH RELATION REPLICA
 
-`check` loads the configuration, expands the replicas, reports overlaps, and exits nonzero on any problem. `explain` prints, for each relation, the profile chain it was assembled from, the expanded variables, each site's patterns with their roots and depths, the discovered replicas, the flow closure per kind, and the resolver. `plan` runs the discovery and decision stages against the live state database without writing anything, then prints what the next cycle would do. The control subcommands post to the running daemon's dashboard port. `forget` clears the records of one replica, for the case where the path behind an identity was replaced rather than moved.
+`replica --help` prints the usage and `replica --version` prints the version. Each option may also be written as `--option=VALUE`. On a usage or runtime error, the command prints `replica: <error>` to standard error and exits with status 2.
 
-**Dashboard.** The loopback HTTP server keeps its protections: GET and POST answer only to loopback hosts, POST only with a matching origin. While the engine is idle, pages and `status.json` read live state. While a cycle runs, they read the report published after the previous cycle instead. Each region of the page has its own rendering function: the header, the status strip, the unfinished operations, a relation section, the activity. A small set of helpers for tags, tables, and links keeps each of those functions under a screen. The stylesheet and favicon are unchanged. `status.json` adds the watch state and the dirty relations.
+- `run` runs cycles at the configured interval. With `--once`, it runs one cycle and exits, with status 1 if that cycle reported an error and 0 otherwise. With `--gate`, it closes the global gate at startup and writes the flag to the database.
+- `check` loads the configuration and expands the replicas. If the configuration does not load, or a footprint overlaps the state folder or a log file, it exits with status 2. If there are other expansion failures or root overlaps, it prints them to standard error and exits with status 1. Otherwise it prints `ok: N relations from PATH` and exits with status 0.
+- `explain` prints the configuration path, the state folder, `interval`, `watch`, `debounce`, the gate default, and the top-level ignore list. Then, for each relation, it prints the profiles it was built from, the expanded variables, the key and fan-out variables, each location with its root, depth, and constraints, the discovered replicas (with `(folder missing)` where the root is absent), the flow closure per kind, the resolver, the relation's ignore list, its transforms, actions, and log path, and its `sync_times`, `watch`, and gate settings.
+- `plan` opens the state database without taking the lock (creating the folder and the database if they are absent), runs discovery and decision, and changes no record and no file. For each relation it prints the relation's state (see the list of states under Dashboard) and any error, unavailable reason, or warning. Then, for each key that needs attention, it prints one line. A key with a plan prints the plan, labeled `next:` while the gate is open and `held:` while the gate is closed. A held key prints its hold reason, labeled `waiting:`. A relation with nothing pending prints `N files in sync`.
+- `status`, `sync`, `pause`, `resume`, `restart`, `halt`, `gate`, and `history` connect to the daemon at 127.0.0.1 on the dashboard port, given as `--port N` or read from `--config PATH`. They give up after three seconds with no answer. A control command prints `ok: /PATH` whenever the daemon answers with a status below 400, which includes a refused restart. `status` prints a summary (version, pid, state, gate, counts, each relation's state), or the raw document with `--json`. `history` prints one line per archived version, marking evicted ones, or the raw document with `--json`. `gate` accepts `open`, `closed`, or `close`.
+- `forget` takes a replica identity as described under Replica identity, such as `dest` or `dest[alpha]`, and deletes its records, its unresolved marks, and its stored pattern. If the identity has no records, it refuses and lists the identities that do. It writes to the state database without taking the lock, so halt the daemon first.
 
-**Logs and events.** The engine emits events through hooks as before: resolved, held, skipped, pending, warned, errored, stale intent, plus action started and finished, watch event received, cycle begun and finished. A condition persisting across cycles is reported once when it appears and again whenever it changes, with no report on the cycles between.
+### Dashboard
+
+The dashboard is an HTTP server bound to 127.0.0.1 on the configured `port`. If the port cannot be bound, the daemon prints the error and runs without a dashboard. Any request whose `Host` header is present but is not `localhost`, `127.0.0.1`, or `::1` (with or without a port) is refused with 403. A POST must carry a loopback `Host`. If the browser sends an `Origin` header, it must carry the dashboard's own address and port. If the browser sends `Sec-Fetch-Site`, the request must come from the page itself or from the address bar.
+
+Routes:
+
+- `GET /`: the main page. It shows a status strip (process, configuration path, database, last and next sync, watch state, this run's operation and error counts, archive use, and overall state), then the unfinished operations (intent rows cleared at startup and any still in the database), then each relation with its replicas and keys, and finally the recent events. For each key it shows the state at each replica and either the planned operation or the hold reason. Each relation's table is cut at 50 pending and 50 in-sync rows unless the request is `/?rel=NAME&all=1`. A relation is tagged `failed`, `unavailable`, `N awaiting sync`, `N held by gate`, `partly unreadable`, `folder missing`, or `in sync`. The page reloads itself after each `refresh` interval, skips the reload while the tab is hidden or text is selected, and shows a banner when the daemon stops answering.
+- `GET /status.json`: the status document, described below.
+- `GET /history?rel=NAME`: the archived versions of a relation, newest first, cut at 100 unless the query has `all=1`. Each version has a download link if its blob is still on disk, and an `evicted` mark otherwise. With `json=1`, the daemon returns the same list as JSON, with `at`, `key`, `replica`, `path`, `reason`, `size`, `hash`, and `available` per version.
+- `GET /blob?h=HASH[&as=NAME]`: downloads an archived blob under the name NAME, or `HASH.bin` if `as` is absent. An unknown hash gives 404.
+- `POST /sync`, `POST /pause`, `POST /resume`, `POST /restart`, `POST /halt`: the control requests described under Cycles and triggers. `/sync`, `/pause`, and `/resume` answer with a 303 redirect to `/`. `/restart` and `/halt` answer with a notice page and status 200, even when the restart was refused. A control route reached with any other method answers 405.
+- `POST /gate?to=open|closed[&rel=NAME]`: opens or closes the global gate, or one relation's gate. It answers with a 303 redirect to `/`, or 400 if `to` is neither `open` nor `closed`.
+
+While the engine is idle, the page and `status.json` read live state. While a cycle is running, they read the report the daemon published after the previous cycle. The page then notes that a sync is running and shows the time of that report, and the status document sets `report_stale` to true. If no cycle has finished yet, a request made during a cycle waits for the engine instead.
+
+The status document contains:
+
+- `state`: `running` or `paused`.
+- `gate`: `open` or `closed`, for the global gate.
+- `pid`, `version`, `uptime_secs`.
+- `last_sync`, `next_sync`, `report_at`: seconds since the Unix epoch. `last_sync` and `last_sync_took_ms` are null before the first cycle. `next_sync` is null before the first cycle and while paused.
+- `report_stale`: true while the document comes from the previous cycle's report.
+- `cycles`: cycles run so far. `ops_applied`: file operations applied. `errors`: error and stale-intent events, so a persisting error counts once when it appears and again each time it changes. `awaiting_sync` and `held`: sums of the per-relation `awaiting` and `held` counts.
+- `watch`: `enabled`, `roots`, and `dirty`.
+- `relations`: one entry per relation with `name`, `state`, `awaiting`, `held`, `gated`, `files`, and `replicas`. `awaiting` counts the keys with a plan while the gate is open, plus the keys waiting on a conflict or an unreadable peer regardless of the gate. `held` counts the keys with a plan while the global or the relation's gate is closed, and is 0 otherwise. `gated` is true when either gate is closed. `files` is the number of keys and `replicas` the number of replicas.
+
+A relation's `state` is the first of these that applies:
+
+- `error`: expansion or the cycle failed, or a footprint overlaps.
+- `unavailable`: a root with recorded snapshots is missing.
+- `awaiting`: the `awaiting` count is above zero.
+- `held`: the `held` count is above zero.
+- `degraded`: a subfolder could not be read.
+- `folder missing`: a replica's root is absent and nothing is recorded for it.
+- `in sync`: none of the above.
+
+### Events and logs
+
+The engine reports what it does as events. At startup the `run` command attaches handlers, called hooks, that write each event to standard error, to the relation logs, and to the dashboard's event list. The event kinds, as the daemon prints them, are `resolved`, `held`, `skipped`, `pending`, `warning`, `error`, `stale intent`, `relocated`, `action`, and `cycle`. A filesystem change report produces no event. It shows up only in the `dirty` list of the status document and in the watch cell of the page.
+
+The daemon writes each event to standard error, except a cycle event with no operations and no errors. At startup it creates the parent folders of each `log` path and opens the file for appending. From then on it writes each event of that relation as one line: the local time as `YYYY-MM-DD HH:MM:SS`, the relation name, the key if the event has one, and the event text. Cycle events stay out of relation logs. The dashboard keeps the most recent `recent_events` events in memory, excluding cycle events, and lists them newest first.
 
 
-## Modules
+## Source layout
 
-- `src/lib.rs`: module list
-- `src/pattern.rs`: patterns, variables, constraints, match and substitute, root, depth, footprint
-- `src/site.rs`: sites, replicas, expansion through the medium
-- `src/observe.rs`: snapshots, observations, bases, transitions
-- `src/flow.rs`: flow statements, kind sets, closure, resolver rules, the policy
-- `src/decide.rs`: situations, assignments, the named rules
-- `src/medium.rs`: the medium trait and the local filesystem
-- `src/blobs.rs`: the content-addressed blob store and eviction
-- `src/store.rs`: SQLite schema and queries
-- `src/apply.rs`: the executor: staging, archiving, journaling, writing, committing, transforms
-- `src/engine.rs`: cycles, discovery, reports, gates, outcome deduplication
-- `src/event.rs`: events, tones, hooks
-- `src/action.rs`: action templating and running
-- `src/watch.rs`: change notification into the main loop
-- `src/config/mod.rs`: loading, validation, the typed result
-- `src/config/text.rs`: the YAML form as typed structs
-- `src/config/merge.rs`: variables, profiles, includes, deep merge, each
-- `src/dashboard/mod.rs`: the server and routes
-- `src/dashboard/http.rs`: requests, responses, loopback checks
-- `src/dashboard/render.rs`: pages
-- `src/dashboard/status.rs`: status.json
-- `src/cli.rs`: argument parsing and the control subcommands
-- `src/main.rs`: the run loop
-- `tests/conformance.rs`: each scenario of the first design under the new form
-- `tests/redesign.rs`: scenarios the first design could not express
+- `src/pattern.rs`: patterns, variables, constraints, matching and substitution, and the derived properties.
+- `src/site.rs`: sites, keys, replicas, fan-out enumeration, and the key walk.
+- `src/observe.rs`: the snapshot, basis, observation, and transition types, and the function that turns a basis and an observation into a transition.
+- `src/flow.rs`: flow statements, kinds, closure, resolver rules, and the policy.
+- `src/decide.rs`: the decision procedure.
+- `src/medium.rs`: the file operation trait and its local filesystem implementation.
+- `src/blobs.rs`: the blob store and eviction.
+- `src/store.rs`: the database schema and queries.
+- `src/apply.rs`: the executor.
+- `src/engine.rs`: cycles, site expansion, reading observations, discovery, the footprint overlap check, reports and relation states, gates, and the suppression of repeated reports.
+- `src/event.rs`: events, tones, and hooks.
+- `src/action.rs`: command templating and running, for actions and transforms.
+- `src/watch.rs`: filesystem change reports into the main loop.
+- `src/config/mod.rs`, `src/config/text.rs`, `src/config/merge.rs`: the loader and validation, the YAML form as typed structures, and variable expansion, profile merging, include resolution, and `each` stamping.
+- `src/dashboard/mod.rs`, `src/dashboard/http.rs`, `src/dashboard/render.rs`, `src/dashboard/status.rs`: the server and routes, the HTTP layer, the pages, and the status document.
+- `src/dashboard/style.css`, `src/dashboard/favicon.svg`: the stylesheet and icon, compiled into the binary and served at `/style.css` and `/favicon.svg`.
+- `src/cli.rs`: command-line parsing and each subcommand except `run`.
+- `src/main.rs`: the `run` subcommand. It sets up the lock file, the signal handlers, the hooks that write events to standard error, the relation logs, and the dashboard, then runs the main loop.
+- `tests/conformance.rs`, `tests/redesign.rs`: end-to-end test suites over temporary folders.
 
-The YAML parser is `serde_norway`, a maintained continuation of `serde_yaml` with the same interface, since `serde_yaml` is archived.
-
-
-## Migration
-
-The configuration form changes entirely. The operator rewrites `config.yaml` by hand with `config.example.yaml` as a guide, checks it with `replica check`, and inspects the result with `replica explain`. The state directory starts fresh, since the first design's record keys do not carry over. The first cycle behaves as a first run, aligning identical content and holding differing content for a decision, so the safe path is to run it under a closed gate and read the dashboard before opening the gate.
-
-
-## Decisions left open
-
-- `changed` actions could also fire for plans held under a gate, so that a notification goes out before the operator opens it.
-- A delete-ratio guard could be added: a cycle planning to delete more than a configured fraction of a relation's keys holds the relation until an operator opens it. The missing-root guard covers the common case of an unmounted volume; the ratio guard covers a mounted volume emptied by mistake.
+The YAML parser is the `serde_norway` crate. It has the same interface as `serde_yaml`.
