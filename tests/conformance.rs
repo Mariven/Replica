@@ -21,7 +21,7 @@ fn load(yaml: &str) -> anyhow::Result<Loaded> {
     config::load(yaml, Path::new("/cfg/config.yaml"))
 }
 
-/// The error text of a configuration the loader must refuse.
+/// The error text from loading a configuration; panics when the loader accepts it.
 fn load_error(yaml: &str) -> String {
     match load(yaml) {
         Err(e) => format!("{e:#}"),
@@ -34,10 +34,10 @@ fn engine(tmp: &TempDir, relations_yaml: &str) -> Engine {
     engine_with_events(tmp, relations_yaml).0
 }
 
-/// Events an engine emitted, as `kind relation key: text` lines.
+/// The events recorded from an engine, one `kind relation key: text` line each.
 type Events = Arc<Mutex<Vec<String>>>;
 
-/// Build an engine over the relations plus a hook recording each event it emits.
+/// Build an engine over the relations, recording each emitted event through a hook.
 fn engine_with_events(tmp: &TempDir, relations_yaml: &str) -> (Engine, Events) {
     let loaded = load(&format!("relations:\n{relations_yaml}")).unwrap();
     let seen: Events = Arc::default();
@@ -48,13 +48,13 @@ fn engine_with_events(tmp: &TempDir, relations_yaml: &str) -> (Engine, Events) {
     (build(tmp, &tmp.path().join("state.db"), loaded, vec![hook]), seen)
 }
 
-/// Assemble an engine from loaded relations: a store at `db`, a blob store beside it, the local filesystem, the temporary directory as the working directory.
+/// Assemble an engine from loaded relations: a store at `db`, a blob store in the temporary directory, the local filesystem, the temporary directory as the working directory.
 fn build(tmp: &TempDir, db: &Path, loaded: Loaded, hooks: Vec<Hook>) -> Engine {
     let blobs = Blobs { dir: tmp.path().join("blobs"), cap: 1 << 20 };
     Engine::new(Store::open(db).unwrap(), blobs, Box::new(Local), loaded.relations, hooks, tmp.path().to_path_buf())
 }
 
-/// YAML for a relation with `source` over folder `a` and `dest` over folder `b` under the given flow. Further fields are appended by the caller at the same indentation.
+/// YAML for a relation with `source` over folder `a` and `dest` over folder `b` under the given flow. Callers append further fields at the same indentation.
 fn pair(name: &str, a: &Path, b: &Path, flow: &str) -> String {
     format!("    {name}:\n      sites: {{ source: \"{}/\", dest: \"{}/\" }}\n      flow: \"{flow}\"\n", a.display(), b.display())
 }
@@ -222,7 +222,7 @@ fn case_4_discovered_fan_out_seeds_the_projects_present_at_start() {
     // A project folder with no docs yet is still a replica, since the variable is bound at the Projects level.
     fs::create_dir_all(projects_dir.join("screamio")).unwrap();
 
-    // On the first cycle the source content reaches each project found under Projects, the empty one through the create edge.
+    // On the first cycle the source content is copied to each project found under Projects, to the empty one through the create edge.
     let eng = engine(&tmp, &style_guide_fan_out(&rules, &projects_dir));
     eng.cycle(None).unwrap();
     for p in ["bouncer", "duckmaster", "screamio"] {
@@ -270,7 +270,7 @@ fn case_5_path_template_rewrite() {
     eng.cycle(None).unwrap();
     assert_eq!(read(flat.join("prose.md")).unwrap(), "write plainly, v3");
 
-    // A variable appearing on some sites only is refused, with the variable named in the message.
+    // A variable appearing on some sites only is refused, with the variable itself quoted in the message.
     let err = load_error("relations:\n    bad:\n      sites: { a: \"/x/{name}.md\", b: \"/y/{other}/f.md\" }\n      flow: \"a <-> b\"\n");
     assert!(err.contains("{name}") || err.contains("{other}"), "unexpected error: {err}");
 
@@ -376,7 +376,7 @@ fn unsettled_conflict_persists_while_the_rest_syncs() {
     assert!(row.needs_attention());
     assert_eq!(report.relations[0].state(false), RelationState::Awaiting(1));
     assert_eq!(read(d.join("f.txt")).unwrap(), "base");
-    // The unchanged conflict is reported once rather than on each cycle.
+    // A conflict unchanged since the last cycle is not reported again.
     assert_eq!(count(&events, "skipped quad f.txt"), 1, "{:?}", events.lock().unwrap());
 
     // Once a and c agree, d conforms and the conflict clears.
@@ -400,7 +400,7 @@ fn self_writes_do_not_churn() {
     eng.cycle(None).unwrap();
     write(a.join("f.txt"), "v2");
     eng.cycle(None).unwrap();
-    // The resolved event carries the plan, not merely an operation count. The first cycle only aligned the records of two identical files.
+    // The resolved event carries the plan text. The first cycle only aligned the records of two identical files.
     let resolved: Vec<String> = events.lock().unwrap().iter().filter(|l| l.starts_with("resolved")).cloned().collect();
     assert_eq!(resolved, vec![
         "resolved g f.txt: resolved: records aligned, no files changed",
@@ -434,7 +434,7 @@ fn stale_intent_is_reported_and_instance_resolves_fresh() {
         write(b.join("f.txt"), "torn write");
     }
 
-    // The next instance reports the stale row through its hook, clears it, then reconciles the key from what is on disk.
+    // The next instance reports the stale row through its hook, clears it, then reconciles the key from the files as they stand.
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen2 = seen.clone();
     let hook: Hook = Box::new(move |e: &Event| {
@@ -498,7 +498,7 @@ fn gate_holds_writes_and_reports_the_plan() {
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");
-    // The held plan is reported once while it stays the same rather than on each cycle.
+    // A held plan unchanged since the last cycle is not reported again.
     assert_eq!(count(&events, "held g f.txt"), 1, "{:?}", events.lock().unwrap());
 
     // The report shows the held plan on the row for f.txt.
@@ -571,7 +571,7 @@ fn archive_keeps_overwritten_and_deleted_content() {
     write(a.join("f.txt"), "delete me");
     eng.cycle(None).unwrap();  // b/f.txt is overwritten, archiving "new content".
     write(a.join("f.txt"), "final");
-    eng.cycle(None).unwrap();  // b/f.txt is overwritten again, archiving "delete me" against the blob gone.txt already left.
+    eng.cycle(None).unwrap();  // b/f.txt is overwritten again, so "delete me" is archived; its blob is already there from gone.txt.
     let (rows, bytes) = eng.store.archive_stats().unwrap();
     assert_eq!(rows, 4);
     let unique: std::collections::BTreeSet<String> = eng.store.archive_entries("g").unwrap().into_iter().map(|e| hex(&e.hash)).collect();
@@ -627,7 +627,7 @@ fn literal_file_patterns_claim_one_file_not_their_folder() {
     write(conf.join("default.conf"), "server {}");
     write(lib.join("app.js"), "1");
 
-    // The renamed file lands in Desktop, which also holds the mylibrary root: the footprints do not overlap, so both relations run.
+    // The renamed file is written into Desktop, which also contains the mylibrary root; the footprints do not overlap, so both relations run.
     let flow = "source <-> dest [edit]; source -> dest [create]";
     let eng = engine(&tmp, &format!(
         "    nginx:\n      sites: {{ source: \"{}/default.conf\", dest: \"{}/nginx-conf.txt\" }}\n      flow: \"{flow}\"\n{}",
@@ -645,7 +645,7 @@ fn reserved_paths_inside_a_root_are_refused() {
     let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
     write(a.join("f.txt"), "x");
     let (mut eng, events) = engine_with_events(&tmp, &pair("g", &a, &b, "source <-> dest [edit]; source -> dest [create]"));
-    // A relation log inside a root would sync itself forever, so the engine refuses the relation instead.
+    // A relation log inside a root is refused, since the daemon's own writes there turn into endless edits.
     eng.reserved = vec![a.join("logs/g.log")];
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")), None);
@@ -706,7 +706,7 @@ fn missing_recorded_root_is_not_a_mass_deletion() {
     let (eng, events) = engine_with_events(&tmp, &pair("g", &a, &b, "source <-> dest [edit delete]"));
     eng.cycle(None).unwrap();
 
-    // The whole destination folder vanishes, as an unmounted volume or a renamed root would.
+    // The whole destination folder vanishes, as happens with an unmounted volume or a renamed root.
     // A root with records but no folder is treated as unavailable, so the deletion does not travel to source.
     fs::remove_dir_all(&b).unwrap();
     eng.cycle(None).unwrap();
@@ -746,7 +746,7 @@ fn markers_bracket_creates_and_deletes() {
     assert_eq!(read(b.join("f.txt")), None);
     assert_eq!(read(b.join("f.txt.replica.tmp")), None);
 
-    // A stray marker left by a crash is skipped by the walk, so it is neither a key nor copied anywhere.
+    // A stray marker left by a crash is skipped by the walk, so no key is made from it.
     write(b.join("g.txt.replica.tmp"), "service: replica\nop: create\n");
     eng.cycle(None).unwrap();
     assert_eq!(read(a.join("g.txt.replica.tmp")), None);
@@ -825,7 +825,7 @@ fn an_edit_made_while_the_peer_is_unreadable_is_delivered_once_the_peer_returns(
     eng.cycle(None).unwrap();
     let seeded = count(&events, "resolved");
 
-    // dest/f.txt becomes a directory, so dest is unreadable; the edit at source waits instead of being recorded as delivered.
+    // dest/f.txt becomes a directory, so dest is unreadable; the edit at source waits with its basis unchanged.
     fs::remove_file(b.join("f.txt")).unwrap();
     fs::create_dir_all(b.join("f.txt")).unwrap();
     write(a.join("f.txt"), "v2");
@@ -834,7 +834,7 @@ fn an_edit_made_while_the_peer_is_unreadable_is_delivered_once_the_peer_returns(
     assert!(events.lock().unwrap().iter().any(|l| l.contains("waiting on dest: unreadable")), "{:?}", events.lock().unwrap());
     assert_eq!(count(&events, "resolved"), seeded, "nothing resolves while the peer is unreadable: {:?}", events.lock().unwrap());
 
-    // The directory goes away and the old file comes back: the pending edit is delivered rather than swapped.
+    // The directory goes away and the old file comes back: the pending edit is delivered to it.
     fs::remove_dir(b.join("f.txt")).unwrap();
     write(b.join("f.txt"), "v1");
     eng.cycle(None).unwrap();
@@ -855,7 +855,7 @@ fn an_edit_at_the_recovered_peer_conflicts_with_the_edit_made_while_it_was_unrea
     fs::create_dir_all(b.join("f.txt")).unwrap();
     write(a.join("f.txt"), "v2");
     eng.cycle(None).unwrap();
-    // The peer returns with an edit of its own: both sides moved since the baseline, which is a conflict rather than an overwrite.
+    // The peer returns with an edit of its own: both sides moved since the baseline, so the key is held as a conflict.
     fs::remove_dir(b.join("f.txt")).unwrap();
     write(b.join("f.txt"), "v1-edited");
     eng.cycle(None).unwrap();
@@ -914,7 +914,7 @@ fn records_outside_a_narrowed_pattern_are_forgotten() {
 
 #[test]
 fn a_variable_on_one_side_against_a_literal_file_is_rejected_at_load() {
-    // A folder of configuration files cannot land in a single named file: the path variable appears on source alone, so the loader asks for fanout or a matching variable.
+    // The path variable appears on source alone, since dest is a single file, so the loader asks for a fanout entry or a matching variable.
     let err = load_error("relations:\n    fx:\n      sites: { source: /conf.d/, dest: /Desktop/x.txt }\n      where: { path: \"*.conf\" }\n      flow: \"source <-> dest [edit]; source -> dest [create]\"\n");
     assert!(err.contains("fanout"), "unexpected error: {err}");
     assert!(err.contains("{path}"), "unexpected error: {err}");
@@ -942,7 +942,7 @@ fn a_failed_write_is_an_error_with_context_and_leaves_no_journal_behind() {
     let errors: Vec<String> = events.lock().unwrap().iter().filter(|l| l.starts_with("error g f.txt")).cloned().collect();
     assert_eq!(errors.len(), 1, "{:?}", events.lock().unwrap());
     assert!(errors[0].contains("creating temp file") && errors[0].contains("f.txt"), "{}", errors[0]);
-    // The intent row is cleared, no marker is left, the records are untouched, so the next cycle retries.
+    // The intent row is cleared, no marker is left, the records are as they were, so the next cycle retries.
     assert!(eng.store.stale_intents().unwrap().is_empty());
     assert!(fs::read_dir(&b).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("replica")));
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");
