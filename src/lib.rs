@@ -8,6 +8,11 @@
 //! - [`medium`]: the file operation trait and the local filesystem.
 //! - [`blobs`]: the content-addressed blob store.
 //! - [`store`]: the SQLite state database.
+//! - [`apply`]: the executor turning an assignment into writes and records.
+//! - [`event`]: events and hooks.
+//! - [`action`]: shell commands for actions and transforms.
+//! - [`engine`]: cycles, discovery, reports, gates.
+//! - [`config`]: loading and validating the configuration.
 
 pub mod pattern;
 pub mod site;
@@ -17,3 +22,8 @@ pub mod decide;
 pub mod medium;
 pub mod blobs;
 pub mod store;
+pub mod apply;
+pub mod event;
+pub mod action;
+pub mod engine;
+pub mod config;

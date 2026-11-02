@@ -18,7 +18,7 @@ A **site** is a named role in a relation, such as `source`, `dest`, `backup`. Th
 
 A **pattern** is the location of a site: an absolute path with variables in braces. A site may list several patterns.
 
-A **variable** inside a pattern stands for one path segment, or, written `{name...}`, for one or more segments. A variable appearing in the pattern of each site of the relation is an **identity variable**. A variable appearing in the patterns of some sites only is a **fan-out variable**.
+A **variable** inside a pattern stands for one path segment, or, written `{name...}`, for one or more segments. A variable appearing in the pattern of each site of the relation is an **identity variable**. A variable that the relation lists under `fanout` is a **fan-out variable**; it may appear on some sites only. A variable that appears on some sites only without being listed there is a mistake, most often a typo, and the loader rejects it.
 
 A **key** is a binding of the identity variables. Two files at two sites belong together exactly when they bind the identity variables to the same values. A relation with no identity variables has exactly one key, the empty binding.
 
@@ -79,7 +79,7 @@ A site may list several patterns, or a map from replica names to patterns. A lis
 
 At the start of a cycle, the daemon expands each site of a relation into replicas. A pattern without fan-out variables is one replica. For a pattern with fan-out variables, the daemon walks down from the root; at the segment holding a fan-out variable it lists the directory and binds the variable to each entry that satisfies the constraints, then continues below each of them. Each complete binding becomes one replica. A fan-out variable name may appear on several sites, but the bindings belong to individual replicas and never relate replicas across sites.
 
-A replica's identity is its site name followed by its fan-out bindings in brackets, such as `dest`, `dest[project=alpha]`, `dest[~/scripts/actors/.cursor/rules]`. The identity is the key under which the store records bases, so adding or removing a sibling replica leaves the others' records alone. The store also remembers the path behind each identity. When the path changes between runs, the daemon reports the change and keeps the records, since a moved folder keeps its files; the operator may clear a replica's records from the command line when the move was really a replacement.
+A replica's identity is its site name followed by its fan-out bindings in brackets, such as `dest`, `dest[project=alpha]`, `dest[~/scripts/actors/.cursor/rules]`. The identity is the key under which the store records bases, so adding or removing a sibling replica leaves the others' records alone. The store also remembers the pattern behind each identity. When the pattern changes between runs, the replica is a different location under the same name: the daemon reports the change, drops the old records (or holds them while the gate is closed), and lets the replica start as a newcomer, so identical content aligns and differing content is held for a decision.
 
 To discover the keys of a relation, the daemon walks each replica from its root down to its depth and matches each regular file against the pattern. A file becomes a key when the constraints admit it and the ignore list does not exclude its tail. The daemon adds the keys it has records for, so a file deleted everywhere since the last cycle still comes up, is seen to be gone, and has its records cleared. A recorded key that the current constraints no longer admit drops out of the relation along with its records, so widening the constraints later starts from the file as it is rather than from a stale basis.
 
@@ -101,6 +101,8 @@ The transition at a replica follows from basis and observation:
 - snapshot and present with a different hash: edited
 - anything and unreadable: unreadable
 
+A tombstone is written only where a recorded snapshot went missing or where the daemon itself deleted the file. A replica that was simply missing keeps no record at all. So a tombstone means that this replica deleted the file, not merely that it lacked it.
+
 The distinction between appeared and recreated settles the open question of the first design about deleted-then-recreated files. A file appearing where the daemon never recorded one conforms to its peers when any peer has a basis, since it is most likely a copy made by hand to bootstrap the location. A file appearing over a tombstone is treated as an edit, since the person deleted it there on purpose and then wrote a new one.
 
 
@@ -119,7 +121,7 @@ The daemon decides each key one replica at a time, applying the rules below. The
 
 **Proposal.** An edited or recreated replica proposes its content. A replica whose file disappeared proposes a deletion. A replica where a file appeared proposes its content only if no replica of that key has a basis yet; if some peer already has one, the newcomer conforms to its peers instead. Unchanged and unreadable replicas propose nothing.
 
-**Carriage.** A proposal travels along the edges of the kind that fits the target. New content travels along `edit` edges to a replica that has the file and along `create` edges to a replica that lacks it. A deletion travels along `delete` edges to a replica that has the file; nothing travels to a replica that lacks the file, since there is nothing to delete. A proposal may pass through intermediate sites, because the daemon uses the transitive closure of each kind's edges.
+**Carriage.** A proposal travels along the edges of the kind that fits the target. New content travels along `edit` edges to a replica that has the file and along `create` edges to a replica that lacks it. A deletion travels along `delete` edges to a replica that has the file; nothing travels to a replica that lacks the file, since there is nothing to delete. When the target is unreadable, its state is unknown, so content may travel along either `edit` or `create` edges and a deletion along `delete` edges. A proposal may pass through intermediate sites, because the daemon uses the transitive closure of each kind's edges.
 
 **Candidates.** The candidates for a target are the proposals that travel to it from other replicas. If the target has a proposal of its own, and that proposal could travel back to at least one of the candidates' replicas, the target's proposal joins the candidates. This is how a two-way edge produces a conflict when both ends change, while a one-way edge lets the upstream content overwrite a downstream edit: the downstream proposal cannot travel upstream, so it never competes.
 
@@ -131,7 +133,7 @@ The daemon decides each key one replica at a time, applying the rules below. The
 
 **Operation.** Once a target's desired state is known, the operation follows: a write when the target has the file with different content, a create when it lacks the file, a delete when it has the file and the decision was absence, nothing when it already matches.
 
-**Commitment.** After the plan applies, the daemon records a new basis for each replica it did not hold: the snapshot it wrote, a tombstone where it deleted or where the file was already missing, or the observed snapshot where nothing changed. Held replicas keep their old basis and are marked unresolved with their reason. While a key has an unresolved mark, the daemon evaluates it fully on each cycle even when nothing on disk changes, so a standing conflict stays visible.
+**Commitment.** After the plan applies, the daemon records a new basis for each replica it did not hold: the snapshot it wrote, a tombstone where it deleted the file or where a recorded snapshot was found missing, or the observed snapshot where nothing changed. A replica that had no record and still has no file keeps no record. Held replicas keep their old basis and are marked unresolved with their reason. While a key has an unresolved mark, the daemon evaluates it fully on each cycle even when nothing on disk changes, so a standing conflict stays visible.
 
 **Forgetting.** When a key is missing at all of its replicas, the daemon clears its records, so a later file with the same name starts from nothing.
 
@@ -147,7 +149,7 @@ An assignment says, for each replica, which content hash it should hold or that 
 1. **Staging.** For each hash the plan needs, the executor finds a replica that was observed with that hash, reads the file once through the medium, hashes it as it goes, and stores it in the blob store under its hash. If the recomputed hash differs from the observed one, the file changed under the daemon and the plan aborts. If no replica holds the hash (because it is a transform output, or because the replica changed during the cycle), the executor looks in the blob store; if the blob store lacks it too, the plan aborts. Since the bytes come out of the blob store rather than from a donor path, a plan may safely overwrite a replica whose previous content another replica is about to receive.
 2. **Archiving.** Each present target about to receive different content or absence is read into the blob store, and an archive row records which relation, key, replica, and path the content came from, along with its hash, its size, the reason for archiving, and the time. A failure here aborts the plan, so no content is destroyed unarchived.
 3. **Journaling.** An intent row records the plan under its relation and key. Beside each file about to be created or deleted, the executor places a marker file, the target's name plus `.replica.tmp`, which states the process id, relation, key, replica, operation, and start time, and notes that the marker disappears when the operation commits.
-4. **Writing.** Each write streams the blob to a temporary file in the target directory, applies the mode and modification time, syncs, renames over the target, syncs the directory. A new file takes the donor's permission bits; an overwritten file keeps its own. Each delete removes the target, treating an already-absent target as done.
+4. **Writing.** Each write streams the blob to a temporary file in the target directory, applies the mode and modification time, syncs, renames over the target, syncs the directory. When times are synced, the modification time comes from the replica that proposed the content. A new file takes that replica's permission bits; an overwritten file keeps its own. Each delete removes the target, treating an already-absent target as done.
 5. **Committing.** In one transaction the records of unheld replicas are replaced by their outcomes, held replicas are marked unresolved, the intent row is removed. The markers are removed. Staged blobs with no archive row are removed.
 
 When a stage fails, the executor removes the markers and the intent row, leaves the records as they were, and reports the error along with the operation and the path, so the next cycle plans again from the last consistent basis. An intent row found at startup means a previous run died mid-plan; the daemon reports it as an unfinished operation, shows it on the dashboard for the life of the process, and reconciles its key from scratch.
@@ -204,6 +206,7 @@ A **relation** has these fields:
     where: { path: "*.js" }
     flow: "source <-> dest [edit create]"
     resolve: "source mtime dest"
+    fanout: [project]
     ignore: ["*.tmp"]
     sync_times: true
     gate: false
@@ -213,14 +216,15 @@ A **relation** has these fields:
     transform: { ... }
     each: { ... }
 
-`sites` maps each site name to a pattern, a list of patterns, or a map from replica names to patterns. `where` constrains variables. `flow` and `resolve` are described above. `each` stamps the relation out once per combination of the listed values; each copy is called `name-value` and sees the value as a variable. This is for several independent relations that share a form but need their own gates, logs, and histories.
+`sites` maps each site name to a pattern, a list of patterns, or a map from replica names to patterns. `where` constrains variables. `fanout` lists the variables that fan a site out into replicas; a fan-out variable must match a single segment and must come before the identity variables of its pattern, so each replica has a fixed root. `flow` and `resolve` are described above. `each` stamps the relation out once per combination of the listed values; each copy is called `name-value` and sees the value as a variable. This is for several independent relations that share a form but need their own gates, logs, and histories.
 
 The loader checks the following, in order, and reports the first failure together with the relation, site, field, and offending text:
 
 - each path is absolute;
 - each pattern is well formed under the restrictions in the patterns section;
 - each variable constraint is a valid glob or regular expression;
-- within a site, each pattern carries the same identity variables (a variable that appears on some sites and not others is a fan-out variable, which is allowed);
+- each variable either appears on every site or is listed under `fanout`; the error for a variable on some sites only offers both fixes, adding it to the other sites or listing it as fan-out;
+- each fan-out variable matches a single segment and comes before the identity variables of its pattern;
 - each site in `flow` and `resolve` is declared;
 - `flow` has at least one edge;
 - no two relations share a name after `each` expansion;
@@ -310,6 +314,5 @@ The configuration form changes entirely. The operator rewrites `config.yaml` by 
 
 ## Decisions left open
 
-- Whether a replica whose recorded path changed should carry its records (the design says yes, with `forget` as the remedy) or start fresh.
 - Whether `changed` actions should also fire for held plans under a gate, for a notification use.
 - Whether to add a delete-ratio guard: a cycle planning to delete more than a configured fraction of a relation's keys holds the relation until an operator opens it. The missing-root guard covers the common case of an unmounted volume; the ratio guard covers a mounted volume emptied by mistake.

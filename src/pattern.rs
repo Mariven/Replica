@@ -20,6 +20,8 @@ pub type Binding = BTreeMap<String, String>;
 pub enum Constraint {
     Glob { text: String, matcher: GlobMatcher },
     Regex { text: String, regex: Regex },
+    /// A constraint written with a leading `!`, admitting what the inner one refuses.
+    Not { text: String, inner: Box<Constraint> },
 }
 
 impl Constraint {
@@ -28,6 +30,9 @@ impl Constraint {
         let text = text.trim();
         if text.is_empty() {
             bail!("empty constraint");
+        }
+        if let Some(negated) = text.strip_prefix('!') {
+            return Ok(Constraint::Not { text: text.to_owned(), inner: Box::new(Constraint::parse(negated)?) });
         }
         if let Some(inner) = text.strip_prefix('~').and_then(|t| t.strip_suffix('~')) {
             let regex = Regex::new(&format!("^(?:{inner})$")).with_context(|| format!("bad regular expression {inner:?}"))?;
@@ -42,13 +47,14 @@ impl Constraint {
         match self {
             Constraint::Glob { matcher, .. } => matcher.is_match(value),
             Constraint::Regex { regex, .. } => regex.is_match(value),
+            Constraint::Not { inner, .. } => !inner.admits(value),
         }
     }
 
     /// The constraint as written.
     pub fn text(&self) -> &str {
         match self {
-            Constraint::Glob { text, .. } | Constraint::Regex { text, .. } => text,
+            Constraint::Glob { text, .. } | Constraint::Regex { text, .. } | Constraint::Not { text, .. } => text,
         }
     }
 

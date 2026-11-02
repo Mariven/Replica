@@ -212,17 +212,8 @@ pub fn display_names(replicas: &[Replica]) -> Vec<String> {
     }).collect()
 }
 
-/// Split the variables of a relation's sites into identity variables (on every site) and fan-out variables (on some sites), rejecting a site whose patterns disagree among themselves.
-pub fn classify_vars(sites: &[Site]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
-    let mut per_site: Vec<BTreeSet<String>> = Vec::new();
-    for site in sites {
-        let sets: Vec<BTreeSet<String>> = site.locations.iter().map(|l| l.pattern.var_names().into_iter().map(str::to_owned).collect()).collect();
-        per_site.push(sets.iter().flatten().cloned().collect());
-    }
-    let all: BTreeSet<String> = per_site.iter().flatten().cloned().collect();
-    let identity: BTreeSet<String> = all.iter().filter(|v| per_site.iter().all(|s| s.contains(*v))).cloned().collect();
-    let fanout: BTreeSet<String> = all.difference(&identity).cloned().collect();
-    // Within one site, each pattern must carry the same identity variables, or keys could not be located at some of its replicas.
+/// Check the variables of a relation against the identity and fan-out sets the loader derived: within a site each pattern carries the same identity variables, fan-out variables match one segment, fan-out variables come before identity variables.
+pub fn validate_vars(sites: &[Site], identity: &BTreeSet<String>, fanout: &BTreeSet<String>) -> Result<()> {
     for site in sites {
         for loc in &site.locations {
             let own: BTreeSet<String> = loc.pattern.var_names().into_iter().map(str::to_owned).collect();
@@ -230,18 +221,23 @@ pub fn classify_vars(sites: &[Site]) -> Result<(BTreeSet<String>, BTreeSet<Strin
             if !missing.is_empty() {
                 bail!("site {:?}: pattern {} lacks identity variable(s) {:?}, which its sibling patterns have", site.name, loc.pattern, missing);
             }
-            // Fan-out variables must come before identity variables, so a replica's root is a directory above its keys.
+            for var in loc.pattern.vars() {
+                if fanout.contains(&var.name) && var.multi {
+                    bail!("site {:?}: fan-out variable {{{}...}} must match a single segment, since replicas are enumerated from directory entries", site.name, var.name);
+                }
+            }
+            // Fan-out variables come before identity variables, so a replica's root is a directory above its keys.
             let segs = loc.pattern.var_segments();
             let first_identity = segs.iter().filter(|(_, v)| identity.contains(&v.name)).map(|(d, _)| *d).min();
             let last_fanout = segs.iter().filter(|(_, v)| fanout.contains(&v.name)).map(|(d, _)| *d).max();
             if let (Some(fi), Some(lf)) = (first_identity, last_fanout) {
                 if lf > fi {
-                    bail!("site {:?}: pattern {} has fan-out variable after an identity variable; fan-out variables must come first", site.name, loc.pattern);
+                    bail!("site {:?}: pattern {} has a fan-out variable after an identity variable; fan-out variables must come first", site.name, loc.pattern);
                 }
             }
         }
     }
-    Ok((identity, fanout))
+    Ok(())
 }
 
 /// Walk a replica for the keys of its files: regular files under the root to the pattern's depth, matched against the pattern, filtered by the ignore globs on their tail.
@@ -338,20 +334,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_splits_identity_from_fanout_and_checks_order() {
+    fn validate_vars_checks_consistency_arity_and_order() {
         let sites = vec![site("source", "/u/rules/main.md"), site("dest", "/u/Projects/{project}/docs/style/main.md")];
-        let (identity, fanout) = classify_vars(&sites).unwrap();
-        assert!(identity.is_empty());
-        assert_eq!(fanout, set(&["project"]));
-        let sites = vec![site("a", "/x/{name}.md"), site("b", "/y/{name}/SKILL.md")];
-        assert_eq!(classify_vars(&sites).unwrap(), (set(&["name"]), set(&[])));
+        assert!(validate_vars(&sites, &set(&[]), &set(&["project"])).is_ok());
         let bad = vec![site("a", "/x/{name}/{project}/f.md"), site("b", "/y/{name}.md")];
-        assert!(classify_vars(&bad).unwrap_err().to_string().contains("fan-out variable after"));
+        assert!(validate_vars(&bad, &set(&["name"]), &set(&["project"])).unwrap_err().to_string().contains("fan-out variable after"));
+        let multi = vec![site("a", "/x/{sub...}/f.md"), site("b", "/y/f.md")];
+        assert!(validate_vars(&multi, &set(&[]), &set(&["sub"])).unwrap_err().to_string().contains("single segment"));
         let mixed = Site { name: "d".into(), locations: vec![
             Location { label: None, pattern: Pattern::parse("/p/{path...}").unwrap() },
             Location { label: None, pattern: Pattern::parse("/q/fixed.md").unwrap() },
         ] };
-        assert!(classify_vars(&[site("s", "/s/{path...}"), mixed]).unwrap_err().to_string().contains("lacks identity variable"));
+        assert!(validate_vars(&[site("s", "/s/{path...}"), mixed], &set(&["path"]), &set(&[])).unwrap_err().to_string().contains("lacks identity variable"));
     }
 
     #[test]
