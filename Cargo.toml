@@ -1,6 +1,6 @@
 [package]
 name = "replica"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
@@ -9,11 +9,11 @@ blake3 = "1.8.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 globset = "0.4.18"
 libc = "0.2"
+notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 regex = "1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
-# serde_yaml is archived upstream (0.9.34 is its final release). It still builds and parses the config format; replace it before a Rust edition or serde change breaks it.
-serde_yaml = "0.9.34"
+serde_norway = "0.9"
 shellexpand = "3.1.2"
 
 [dev-dependencies]
