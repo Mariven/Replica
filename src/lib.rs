@@ -1,21 +1,21 @@
 //! Replica keeps related local files in agreed states.
 //!
-//! - [`pattern`]: path patterns with variables; matching and substitution.
-//! - [`site`]: sites, keys, replicas, discovery of keys under a replica.
-//! - [`observe`]: snapshots, observations, bases, transitions.
-//! - [`flow`]: flow statements, kinds, closure, resolver rules.
-//! - [`decide`]: the named rules deciding what each replica of a key should hold.
+//! - [`pattern`]: path patterns with variables, matched against paths and filled back in from bindings.
+//! - [`site`]: sites, the replicas a site expands to, keys, and the walk collecting the keys under a replica.
+//! - [`observe`]: snapshots, the recorded basis and the current observation of a file, and the transition between them.
+//! - [`flow`]: flow statements and their kinds, the closure over them, and the resolver rules.
+//! - [`decide`]: the rules deciding which content each replica of a key should hold.
 //! - [`medium`]: the file operation trait and the local filesystem.
 //! - [`blobs`]: the content-addressed blob store.
 //! - [`store`]: the SQLite state database.
-//! - [`apply`]: the executor turning an assignment into writes and records.
+//! - [`apply`]: the executor, which turns an assignment into file writes and database records.
 //! - [`event`]: events and hooks.
 //! - [`action`]: shell commands for actions and transforms.
-//! - [`engine`]: cycles, discovery, reports, gates.
+//! - [`engine`]: the cycle, with discovery, reports, and gates.
 //! - [`config`]: loading and validating the configuration.
 //! - [`watch`]: filesystem change notification feeding the main loop.
 //! - [`dashboard`]: the loopback HTTP dashboard.
-//! - [`cli`]: subcommands and the ones that run without a daemon.
+//! - [`cli`]: the subcommands, some of which run without a daemon.
 
 pub mod pattern;
 pub mod site;

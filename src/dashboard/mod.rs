@@ -1,6 +1,6 @@
 //! The loopback dashboard: a small HTTP server answering pages, `status.json`, history, blob downloads, and control posts.
 //!
-//! Pages read live state while the engine is idle and the report published after the last cycle while a cycle runs, marked as such.
+//! A page reads live state whenever the engine is idle. While a cycle holds the engine, the page falls back to the report published after the previous cycle and says so.
 
 pub mod http;
 pub mod render;
@@ -20,19 +20,21 @@ use chrono::{DateTime, Local};
 
 use crate::blobs::Blobs;
 use crate::config::DashboardConfig;
-use crate::engine::{Engine, Report, STOP};
+use crate::engine::{Engine, Gates, Report, STOP};
 use crate::event::Stamped;
 use crate::store::Intent;
 
 use http::{Request, Response, post_allowed, is_loopback_host};
 
 /// Requests from the dashboard to the main loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Sync,
     Pause,
     Resume,
     Stop,
+    /// Persist a gate change the dashboard has already applied to the shared flags.
+    Gate { relation: Option<String>, closed: bool },
 }
 
 /// Process telemetry shared between the main loop and the dashboard.
@@ -50,7 +52,7 @@ pub struct Runtime {
     pub paused: AtomicBool,
     pub watching: AtomicBool,
     pub watched_roots: Mutex<Vec<PathBuf>>,
-    /// Relations with changes noticed by the watcher, awaiting an early cycle.
+    /// Relations in which the watcher has noticed a change. Once the debounce period passes, the main loop empties this set and runs an early cycle over those relations.
     pub dirty: Mutex<BTreeSet<String>>,
     /// Intent rows found and cleared at startup, shown for the life of the process.
     pub cleared_intents: Mutex<Vec<Intent>>,
@@ -61,7 +63,7 @@ pub struct Runtime {
     pub exit_code: std::sync::atomic::AtomicI32,
 }
 
-/// Everything a page reads from the engine, taken at one moment.
+/// Everything a page reads from the engine, all taken at the same moment.
 pub struct Snapshot {
     pub at: SystemTime,
     pub report: Report,
@@ -84,11 +86,13 @@ pub fn take_snapshot(eng: &Engine) -> Snapshot {
 /// Everything a request handler needs.
 pub struct Dashboard {
     pub engine: Arc<Mutex<Engine>>,
+    /// The engine's gate flags, shared so a gate request takes effect at once even while a cycle holds the engine.
+    pub gates: Arc<Gates>,
     pub events: Arc<Mutex<VecDeque<Stamped>>>,
     pub rt: Arc<Runtime>,
     pub config: DashboardConfig,
     pub blobs: Blobs,
-    /// Validate the configuration before a restart; None refuses restarts.
+    /// Check before a restart that the configuration still loads. On an error the dashboard refuses the restart and keeps the current process running.
     pub revalidate: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
@@ -101,7 +105,7 @@ fn current_snapshot(ctx: &Dashboard) -> (Arc<Snapshot>, bool) {
             (snap, false)
         }
         Err(std::sync::TryLockError::WouldBlock) => {
-            // The snapshot guard is released before any wait on the engine, which publishes the snapshot while holding the engine.
+            // The main loop takes the snapshot lock while it already holds the engine, the opposite of the order here. To avoid a deadlock with it, this thread drops the snapshot guard before it blocks on the engine below.
             let published = ctx.rt.snapshot.lock().unwrap().clone();
             match published {
                 Some(snap) => (snap, true),
@@ -141,7 +145,7 @@ struct Blob {
     name: String,
 }
 
-/// Answer one connection.
+/// Answer a connection.
 fn handle(mut stream: TcpStream, ctx: &Dashboard) {
     let Some(req) = Request::read(&mut stream) else {
         Response::text("400 Bad Request", "bad request").write(&mut stream);
@@ -200,17 +204,19 @@ fn route(req: &Request, ctx: &Dashboard) -> Result<Response, Blob> {
                 return Ok(Response::text("400 Bad Request", "gate needs to=open or to=closed"));
             };
             let word = if closed { "closed" } else { "opened" };
-            let eng = ctx.engine.lock().unwrap();
-            match req.param("rel") {
+            // The flag changes at once, so a running cycle honors it at its next key; the main loop persists it when it next holds the engine.
+            let relation = req.param("rel");
+            match &relation {
                 Some(rel) => {
-                    eng.set_relation_gate(&rel, closed);
+                    ctx.gates.set_relation(rel, closed);
                     eprintln!("dashboard: gate for {rel} {word}");
                 }
                 None => {
-                    eng.set_global_gate(closed);
+                    ctx.gates.set_global(closed);
                     eprintln!("dashboard: global gate {word}");
                 }
             }
+            let _ = rt.commands.send(Command::Gate { relation, closed });
             Response::redirect_home()
         }
         ("POST", "/pause") => {

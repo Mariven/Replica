@@ -1,4 +1,4 @@
-//! The daemon: load the configuration, open the state, serve the dashboard, run cycles on the schedule and sooner when the watcher reports a change, stop cleanly on signals and dashboard commands.
+//! The daemon. It loads the configuration, opens the state directory, serves the dashboard, then runs a cycle at each interval or sooner when the watcher reports a change. A signal or a dashboard command stops it cleanly.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
@@ -22,7 +22,7 @@ use replica::medium::Local;
 use replica::store::Store;
 use replica::watch::{Notice, Watch};
 
-/// Signal handler: an atomic store alone, which is safe inside a handler. The engine checks the flag between keys.
+/// Signal handler. It only stores an atomic flag, which is safe inside a signal handler. The engine checks the flag between keys and stops.
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
@@ -30,14 +30,14 @@ extern "C" fn on_signal(_: libc::c_int) {
 /// Stop cleanly on SIGTERM and SIGINT instead of dying mid-write.
 fn install_signal_handlers() {
     let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: the handler stores an atomic alone, and signal() with a plain function pointer is the documented use.
+    // SAFETY: the handler only stores an atomic, which is async-signal-safe. Passing a plain function pointer to signal() is its documented use.
     unsafe {
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGINT, handler);
     }
 }
 
-/// One line of the log for an event, with the local time.
+/// Format an event as a log line stamped with the local time.
 fn render_line(e: &Event) -> String {
     let stamp = DateTime::<LocalTime>::from(SystemTime::now()).format("%Y-%m-%d %H:%M:%S");
     let key = e.key();
@@ -49,12 +49,13 @@ fn render_line(e: &Event) -> String {
     }
 }
 
-/// Something the main loop waits for.
+/// A message for the main loop: a dashboard command or a watcher notice.
 enum Msg {
     Command(dashboard::Command),
     Notice(Notice),
 }
 
+/// Entry point: run the command line and exit with its status.
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let code = match run(&argv) {
@@ -91,10 +92,10 @@ fn run(argv: &[String]) -> Result<i32> {
     }
 }
 
-/// Hooks: standard error, counters, per-relation log files, the dashboard's activity list.
+/// Build the event hooks. Events go to standard error, to the runtime counters, to the log file of each relation configured with one, and to the dashboard's activity list.
 fn build_hooks(loaded: &config::Loaded, runtime: &Arc<Runtime>, events: &Arc<Mutex<VecDeque<Stamped>>>, cap: usize) -> Result<Vec<Hook>> {
     let mut hooks: Vec<Hook> = vec![Box::new(|e: &Event| {
-        // A quiet cycle is routine; everything else is worth a line.
+        // Skip the log line for a cycle with no operations and no errors, since such a cycle is routine.
         if !matches!(e, Event::Cycle { ops: 0, errors: 0, .. }) {
             eprintln!("{}", render_line(e));
         }
@@ -139,7 +140,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
     fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
     install_signal_handlers();
 
-    // One daemon per state directory, so two never race on the same journal.
+    // Lock the state directory so only a single daemon runs against this journal.
     let lock_path = state.join("replica.lock");
     let lock = fs::File::create(&lock_path).with_context(|| format!("creating {}", lock_path.display()))?;
     if let Err(e) = lock.try_lock() {
@@ -169,7 +170,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
         commands: cmd_tx,
         exit_code: AtomicI32::new(0),
     });
-    // Dashboard commands arrive on their own channel and are forwarded, so the dashboard never learns about the watcher.
+    // Forward dashboard commands from their own channel into the main loop's channel. The dashboard then stays independent of the watcher and its notice type.
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -193,7 +194,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
     }
     let n_relations = eng.relations.len();
     let gate_open = !eng.gates.globally_gated();
-    // The watcher lives as long as this binding; dropping it stops the notifications.
+    // Keep the watcher in this binding until the loop ends, since dropping it stops the notifications.
     let _watch = if settings.watch {
         let (ntx, nrx) = mpsc::channel::<Notice>();
         let tx = tx.clone();
@@ -218,6 +219,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
     } else {
         None
     };
+    let gates = eng.gates.clone();
     let engine = Arc::new(Mutex::new(eng));
     eprintln!(
         "replica {} pid {}: {} from {}, state in {}, gate {}, watch {}{}",
@@ -236,6 +238,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
         let revalidate_path = config_path.to_path_buf();
         dashboard::serve(Arc::new(Dashboard {
             engine: engine.clone(),
+            gates: gates.clone(),
             events,
             rt: runtime.clone(),
             config: dash.clone(),
@@ -254,7 +257,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
         eprintln!("replica pid {}: stopping with status {code}", rt.pid);
         code
     };
-    // Run one cycle over all relations or the dirty ones, publish a snapshot for the dashboard, log a summary when anything happened.
+    // Run a cycle over all relations, or over the dirty ones alone. Afterwards publish a snapshot for the dashboard and log a summary if the cycle applied an operation or hit an error.
     let run_cycle = |only: Option<&BTreeSet<String>>, paused: bool| -> Result<u64> {
         let begun = SystemTime::now();
         let timer = Instant::now();
@@ -287,7 +290,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
             return Ok(exit(&runtime));
         }
         let now = Instant::now();
-        // A full cycle when the schedule is due; an early cycle over dirty relations when the quiet period has passed.
+        // Run a full cycle once the schedule is due. Otherwise, once the debounce period after the last notice has passed, run an early cycle over the dirty relations alone.
         if !paused && now >= deadline {
             let errors = run_cycle(None, false)?;
             runtime.dirty.lock().unwrap().clear();
@@ -310,7 +313,7 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
             }
             continue;
         }
-        // Wait for the nearest deadline, a message, or a stop signal; signals set STOP alone, so wake at least once a second.
+        // Sleep until the nearest deadline or the next message. A signal only sets STOP without waking this thread, so cap the sleep at a second to notice it.
         let mut wait = Duration::from_secs(1);
         if !paused {
             wait = wait.min(deadline.saturating_duration_since(now));
@@ -338,6 +341,13 @@ fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
                 runtime.paused.store(false, Ordering::Relaxed);
                 deadline = Instant::now();
                 eprintln!("dashboard: resumed");
+            }
+            Ok(Msg::Command(dashboard::Command::Gate { relation, closed })) => {
+                let eng = engine.lock().unwrap();
+                match relation {
+                    Some(rel) => eng.set_relation_gate(&rel, closed),
+                    None => eng.set_global_gate(closed),
+                }
             }
             Ok(Msg::Command(dashboard::Command::Stop)) | Err(RecvTimeoutError::Disconnected) => return Ok(exit(&runtime)),
             Ok(Msg::Notice(Notice::Changed { relations, .. })) => {

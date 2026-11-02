@@ -1,7 +1,7 @@
-//! The medium: how the engine lists, reads, writes, removes files. The local filesystem is the only implementation; the trait keeps a remote one possible without changes to the engine.
+//! The medium. The engine lists, reads, writes, and removes files through this trait. The local filesystem is the only implementation so far; the trait exists so a remote one can be added later without changing the engine.
 //!
-//! Writes go to a temporary sibling in the target directory, are synced, then renamed over the target, so a crash leaves either the old file or the new one.
-//! Marker files placed beside a file about to be created or deleted carry a note for whoever finds them after a crash; walks skip them.
+//! A write goes to a temporary sibling in the target directory, gets synced, then is renamed over the target, so after a crash the target is either the old file or the complete new one.
+//! A marker file goes beside each file about to be created or deleted. It carries a note for whoever finds it after a crash; directory walks skip it.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -10,19 +10,19 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-/// Suffix of the temporary sibling a write stages through.
+/// Suffix for the temporary sibling of a write.
 pub const TEMP_SUFFIX: &str = ".replica-write";
 /// Suffix of the marker placed beside a file during a create or delete.
 pub const MARKER_SUFFIX: &str = ".replica.tmp";
-/// Longest file name most filesystems accept, in bytes.
+/// The file name length limit on most filesystems, in bytes.
 const NAME_MAX: usize = 255;
 
-/// What a directory entry or a stat call found.
+/// The file type, as reported by a directory entry or a stat call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntryKind {
     File,
     Dir,
-    /// Symbolic links, sockets, devices: skipped by walks, unreadable as replicas.
+    /// Symbolic links, sockets, and devices. Walks skip them. A replica path of this kind counts as unreadable.
     Other,
 }
 
@@ -43,7 +43,7 @@ pub struct Meta {
     pub mode: u32,
 }
 
-/// What an atomic write recorded: the modification time the filesystem kept, plus a warning when a non-fatal step failed.
+/// The result of an atomic write: the modification time now on the file, plus a warning if a non-fatal step failed.
 pub struct Written {
     pub mtime: SystemTime,
     pub warning: Option<String>,
@@ -57,7 +57,7 @@ pub trait Medium: Send + Sync {
     fn stat(&self, path: &Path) -> io::Result<Option<Meta>>;
     /// Open a file for reading.
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
-    /// Write content atomically into place, creating parent directories, applying mode and mtime when given.
+    /// Write content atomically into place, creating parent directories as needed. The mode and mtime are applied when given.
     fn write(&self, path: &Path, content: &mut dyn Read, mtime: Option<SystemTime>, mode: Option<u32>) -> Result<Written>;
     /// Remove a file; a file already gone counts as removed.
     fn remove(&self, path: &Path) -> io::Result<()>;
@@ -119,7 +119,7 @@ impl Medium for Local {
         let mut warning = None;
         let staged: Result<()> = (|| {
             let mut f = fs::File::create(&tmp).with_context(|| format!("creating temp file {}", tmp.display()))?;
-            // The mode goes on before any byte lands, so a private donor's content is never world-readable in the temp file.
+            // The permissions are set while the temp file is still empty, so content copied from a private donor is protected from the first byte on.
             if let Some(m) = mode {
                 use std::os::unix::fs::PermissionsExt;
                 if let Err(e) = f.set_permissions(fs::Permissions::from_mode(m)) {
@@ -138,7 +138,7 @@ impl Medium for Local {
             return Err(e);
         }
         fs::rename(&tmp, path).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
-        // A directory sync makes the rename durable; filesystems refusing it still hold the synced content.
+        // The parent directory is synced so the rename survives a crash. Some filesystems refuse this sync; the content itself is already synced, so the refusal is ignored.
         if let Ok(d) = fs::File::open(parent) {
             let _ = d.sync_all();
         }
@@ -162,7 +162,7 @@ impl Medium for Local {
     }
 }
 
-/// Build a sibling name `<prefix><name><suffix>`, falling back to a hash of the name when the result would exceed NAME_MAX.
+/// Build the sibling name `<prefix><name><suffix>`. When that exceeds NAME_MAX, a short hash of the name stands in for the name itself.
 pub fn sibling_name(path: &Path, prefix: &str, suffix: &str) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     if prefix.len() + name.len() + suffix.len() <= NAME_MAX {
@@ -214,7 +214,7 @@ mod tests {
         let meta = Local.stat(&path).unwrap().unwrap();
         assert_eq!((meta.kind, meta.size), (EntryKind::File, 2));
         assert!(fs::read_dir(tmp.path().join("sub")).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(TEMP_SUFFIX)));
-        // Listing a missing directory is empty; stat of a missing path is None; removing twice is fine.
+        // A missing directory lists as empty, a missing path stats as None, and removing a file twice succeeds.
         assert!(Local.list(&tmp.path().join("absent")).unwrap().is_empty());
         assert_eq!(Local.stat(&tmp.path().join("absent")).unwrap(), None);
         Local.remove(&path).unwrap();

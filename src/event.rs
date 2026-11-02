@@ -1,15 +1,15 @@
-//! Events the engine emits while it works, and the hooks that receive them: loggers, counters, the dashboard's activity list, actions.
+//! Events the engine emits as it works. Hooks receive them: loggers, counters, the dashboard's activity list, and the actions.
 
 use std::time::SystemTime;
 
 /// Something that happened during a cycle, tied to a relation and, where it applies, to a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A plan applied. `detail` describes the operations; `ops` counts them; `paths` are the written or deleted paths, for actions.
+    /// A plan was applied. `detail` describes the operations and `ops` counts them. `paths` lists the paths written or deleted, for actions to use.
     Resolved { relation: String, key: String, ops: usize, detail: String, paths: Vec<String> },
     /// A plan exists but a gate holds it.
     Held { relation: String, key: String, detail: String },
-    /// A replica of the key waits: a conflict no rule decides, or an unreadable peer.
+    /// A replica of the key is waiting, either because the rules leave its conflict undecided or because a peer is unreadable.
     Skipped { relation: String, key: String, reason: String },
     /// The relation waits as a whole, as when a root with records is missing.
     Pending { relation: String, reason: String },
@@ -20,9 +20,9 @@ pub enum Event {
     StaleIntent { relation: String, key: String, detail: String },
     /// A replica's pattern differs from the one its records were made under.
     Relocated { relation: String, replica: String, from: String, to: String },
-    /// An action ran; `ok` is false on a nonzero exit or a timeout.
+    /// An action ran. `ok` is false when it exited nonzero or timed out.
     Action { relation: String, name: String, ok: bool, detail: String },
-    /// The watcher saw a change under a relation's roots.
+    /// The watcher reported a change under a relation's roots.
     Watched { relation: String, path: String },
     /// A cycle finished over the listed relations.
     Cycle { relations: Vec<String>, ops: usize, errors: usize, millis: u128 },

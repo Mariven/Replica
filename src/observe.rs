@@ -1,11 +1,11 @@
-//! What the daemon recorded for a file, what it finds on disk, how the two compare.
+//! The daemon's record of a file, the observation of the file as it now stands on disk, and the transition between the two.
 
 use std::time::SystemTime;
 
 /// Content hash as BLAKE3 bytes.
 pub type Hash = [u8; 32];
 
-/// Modification time, size, content hash of a file as it stood at one moment.
+/// The modification time, size, and content hash of a file at a single moment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub mtime: SystemTime,
@@ -13,12 +13,12 @@ pub struct Snapshot {
     pub hash: Hash,
 }
 
-/// What the store remembers for a key at a replica.
+/// The store's record for a key at a replica.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Basis {
-    /// The key was never recorded at this replica.
+    /// No record exists for the key at this replica.
     None,
-    /// The daemon saw the file deleted here, or committed a deletion here.
+    /// The file is recorded as deleted here, either because the daemon found it gone or because the daemon deleted it.
     Tombstone,
     /// The file as it stood after the last agreement.
     Snapshot(Snapshot),
@@ -39,7 +39,7 @@ impl Basis {
     }
 }
 
-/// What a cycle finds on disk for a key at a replica.
+/// The state of a key's file at a replica, as a cycle finds it on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Observation {
     Present(Snapshot),
@@ -62,12 +62,12 @@ impl Observation {
     }
 }
 
-/// How a replica moved between its basis and the current observation.
+/// The change at a replica from its basis to the current observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transition {
     Unchanged,
     Edited,
-    /// Present with no record at all. Conforms to peers with a basis, proposes otherwise.
+    /// Present without any record. Such a replica conforms to any peer with a basis and otherwise proposes its own content.
     Appeared,
     /// Present over a tombstone. Treated as an edit, since the deletion here was deliberate.
     Recreated,

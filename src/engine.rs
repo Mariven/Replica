@@ -1,6 +1,6 @@
-//! Run cycles: expand sites into replicas, refuse overlaps, discover keys, observe, decide, apply or hold, report.
+//! The engine runs cycles. In a cycle it expands sites into replicas, refuses overlapping roots, discovers keys, observes each replica, decides what to do with each key, then applies the plan or holds it under a gate, reporting as it goes.
 //!
-//! A cycle visits each relation in turn. For each key it reads one observation per replica, skips the key when nothing moved since the last agreement, otherwise decides and applies (or reports the plan under a closed gate). Conditions persisting across cycles are reported when they appear or change, not on each pass.
+//! A cycle visits each relation in turn. For each key it reads an observation from each replica. When nothing has moved since the last agreement, the key is skipped. Otherwise the policy produces a plan. The engine applies it. Under a closed gate it only reports the plan. When a condition persists across cycles, the engine reports it when it first appears and again whenever it changes, so repeated passes stay quiet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash as _, Hasher};
@@ -21,12 +21,12 @@ use crate::flow::{Kind, Policy};
 use crate::medium::{EntryKind, Medium};
 use crate::observe::{Basis, Observation, Snapshot, Transition, classify};
 use crate::site::{Key, Replica, Site, discover_keys, display_names};
-use crate::store::{Intent, RecordMap, Store, to_epoch_ms};
+use crate::store::{Intent, Noted, RecordMap, Store, to_epoch_ms};
 
-/// Set by a signal handler or a dashboard command. The engine checks it between keys and returns from the cycle early.
+/// A signal handler or a dashboard command sets this flag. The engine checks it between keys and leaves the cycle early once it is set.
 pub static STOP: AtomicBool = AtomicBool::new(false);
 
-// Outcome keys for relation-level conditions. A leading NUL keeps them apart from canonical key texts.
+// Outcome keys for relation-level conditions. Each starts with a NUL, which no canonical key text contains, so they stay distinct from real keys.
 const KEY_EXPAND: &str = "\0expand";
 const KEY_OVERLAP: &str = "\0overlap";
 const KEY_ROOT: &str = "\0root";
@@ -54,7 +54,7 @@ pub struct Relation {
 }
 
 impl Relation {
-    /// A digest of everything that changes how keys are decided, so a changed policy forces one full evaluation.
+    /// A digest of the settings that affect how keys are decided. When it differs from the stored digest, the engine evaluates each key of the relation in full once more.
     pub fn fingerprint(&self) -> String {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for site in &self.sites {
@@ -77,7 +77,7 @@ impl Relation {
     }
 }
 
-/// Write barriers. A closed gate lets discovery and planning continue while no file or record changes.
+/// Gates hold back writes. While a gate is closed the engine still discovers keys and plans, but it writes nothing to the files or the store.
 #[derive(Default)]
 pub struct Gates {
     global: AtomicBool,
@@ -85,6 +85,7 @@ pub struct Gates {
 }
 
 impl Gates {
+    /// True when the global gate is closed.
     pub fn globally_gated(&self) -> bool {
         self.global.load(Ordering::Relaxed)
     }
@@ -99,16 +100,18 @@ impl Gates {
         self.globally_gated() || self.relation_flag(relation)
     }
 
+    /// Close or open the global gate in memory.
     pub fn set_global(&self, gated: bool) {
         self.global.store(gated, Ordering::Relaxed);
     }
 
+    /// Close or open a relation's gate in memory.
     pub fn set_relation(&self, relation: &str, gated: bool) {
         self.relations.lock().unwrap().insert(relation.into(), gated);
     }
 }
 
-/// The engine over one store, blob store, medium, and set of relations.
+/// The engine: a store, a blob store, a medium, and the relations it runs over them.
 pub struct Engine {
     pub store: Store,
     pub blobs: Blobs,
@@ -116,24 +119,24 @@ pub struct Engine {
     pub relations: Vec<Relation>,
     pub hooks: Vec<Hook>,
     pub gates: Arc<Gates>,
-    /// Paths the daemon itself writes. A root containing or inside one is refused.
+    /// Paths the daemon itself writes to. The engine refuses any root that contains one of these or lies inside one.
     pub reserved: Vec<PathBuf>,
     /// Working directory for actions and transforms: the state directory.
     pub workdir: PathBuf,
-    /// Last reported outcome per (relation, key), hashed, so a persisting condition is reported once.
+    /// A hash of the last reported outcome for each (relation, key). When a condition persists across cycles, the engine reports it when it first appears, then stays quiet until it changes.
     outcomes: Mutex<BTreeMap<(String, String), u64>>,
-    /// Relations whose stored fingerprint differs from the loaded one; each key is evaluated once, then the fingerprint is stored.
+    /// Relations whose stored fingerprint differs from the configured one. The engine evaluates each of their keys in full once, then stores the new fingerprint.
     stale_policy: Mutex<BTreeSet<String>>,
 }
 
-/// What a cycle did.
+/// The tallies of a cycle: operations applied and errors counted.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CycleSummary {
     pub ops: usize,
     pub errors: usize,
 }
 
-/// Slots of one key with the facts the cycle and the report both need.
+/// The slots of a key, with the facts both the cycle and the report need.
 struct Inspection {
     situation: Situation,
     /// No replica has the file.
@@ -142,7 +145,7 @@ struct Inspection {
     settled: bool,
 }
 
-/// Keys found for a relation, the subfolders the walk could not read, the recorded keys the constraints no longer admit.
+/// The result of discovery for a relation: its keys, the subfolders the walk could not read, and the recorded keys now outside the constraints.
 struct Discovery {
     keys: BTreeSet<Key>,
     failures: Vec<String>,
@@ -150,7 +153,7 @@ struct Discovery {
 }
 
 impl Engine {
-    /// Build an engine. Gate flags come from the relation defaults and the persisted flags; a closed gate on either side closes the gate.
+    /// Build an engine. A relation's gate starts closed when either its configured default or its persisted flag says so.
     pub fn new(store: Store, blobs: Blobs, medium: Box<dyn Medium>, relations: Vec<Relation>, hooks: Vec<Hook>, workdir: PathBuf) -> Engine {
         let gates = Gates::default();
         let mut stale = BTreeSet::new();
@@ -188,7 +191,7 @@ impl Engine {
         }
     }
 
-    /// True when `value` differs from what was last recorded under (relation, key), recording it. A first sighting counts as a change.
+    /// Record `value` under (relation, key) and return true when it differs from the previous record. The first value seen counts as a change.
     fn changed(&self, relation: &str, key: &str, value: &str) -> bool {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         value.hash(&mut h);
@@ -248,7 +251,7 @@ impl Engine {
         for (i, _) in &expanded {
             self.clear_outcome(&self.relations[*i].name, KEY_EXPAND);
         }
-        // Overlaps are checked against every relation, not only the ones this cycle runs, since a fan-out elsewhere can produce one.
+        // The overlap check covers all relations, including those this cycle skips, since a fan-out in a skipped relation can overlap a root in one that runs.
         let all = if only.is_some() { self.expand_all(None).0 } else { expanded.clone() };
         let conflicts = footprint_conflicts(&self.relations, &all, &self.reserved);
         let skip: BTreeSet<usize> = conflicts.iter().flat_map(|c| c.relations.iter().copied()).collect();
@@ -296,24 +299,31 @@ impl Engine {
         Ok(summary)
     }
 
-    /// Note each replica's pattern in the store; a replica whose pattern changed starts over, unless a gate holds the relation.
-    fn note_replicas(&self, rel: &Relation, replicas: &[Replica]) -> Result<()> {
+    /// Record each replica's pattern in the store. When a replica's pattern has changed since the last run, its records start over, unless a gate holds the relation.
+    fn note_replicas(&self, rel: &Relation, replicas: &[Replica]) -> Result<bool> {
         let gated = self.gates.is_gated(&rel.name);
+        let mut fresh = false;
         for r in replicas {
-            if let Some(previous) = self.store.note_replica(&rel.name, r.id(), Path::new(r.pattern.text()))? {
-                self.emit(Event::Relocated { relation: rel.name.clone(), replica: r.id().to_owned(), from: previous.clone(), to: r.pattern.text().to_owned() });
-                if !gated {
-                    self.store.forget_replica(&rel.name, r.id())?;
-                } else {
-                    // Under a gate the old pattern stays recorded, so the move is reported again once the gate opens.
-                    self.store.note_replica(&rel.name, r.id(), Path::new(&previous))?;
+            match self.store.note_replica(&rel.name, r.id(), Path::new(r.pattern.text()))? {
+                Noted::Same => {}
+                // A replica seen for the first time has no records, so keys settled among its peers must be decided again with it present.
+                Noted::New => fresh = true,
+                Noted::Moved(previous) => {
+                    self.emit(Event::Relocated { relation: rel.name.clone(), replica: r.id().to_owned(), from: previous.clone(), to: r.pattern.text().to_owned() });
+                    if !gated {
+                        self.store.forget_replica(&rel.name, r.id())?;
+                        fresh = true;
+                    } else {
+                        // Under a gate the old pattern stays recorded, so the move is reported again once the gate opens.
+                        self.store.note_replica(&rel.name, r.id(), Path::new(&previous))?;
+                    }
                 }
             }
         }
-        Ok(())
+        Ok(fresh)
     }
 
-    /// Collect the keys of a relation: files found under each replica plus recorded keys, less the recorded keys the constraints or the ignore list no longer admit.
+    /// Collect the keys of a relation: the files found under each replica together with the recorded keys, dropping any recorded key that the constraints or the ignore list now exclude.
     fn discover(&self, rel: &Relation, replicas: &[Replica], records: &RecordMap) -> Result<Discovery> {
         let mut keys = BTreeSet::new();
         let mut failures = Vec::new();
@@ -322,7 +332,7 @@ impl Engine {
             failures.extend(found.failures);
             keys.extend(found.keys);
         }
-        // A key is admitted only when each replica can locate it within its constraints and no replica's tail is ignored.
+        // A key stays in when each replica can place it within its constraints and the ignore list matches none of the resulting tails.
         let admitted = |key: &Key| replicas.iter().all(|r| match r.locate(key) {
             Ok(path) => r.pattern.matches(&path).is_some() && !r.pattern.tail(&path).is_some_and(|t| rel.ignore.iter().any(|g| g.is_match(&t))),
             Err(_) => false,
@@ -355,7 +365,7 @@ impl Engine {
         let mut all_recorded = true;
         for r in replicas {
             let basis = by_replica.and_then(|m| m.get(r.id())).cloned().unwrap_or(Basis::None);
-            // A replica with no record and no file is at rest; one with no record and a file is a newcomer the policy must see.
+            // A replica with neither a record nor a file is at rest. A replica with a file but no record holds a newcomer, which the policy has to consider.
             let path = r.locate(key)?;
             let observation = observe(self.medium.as_ref(), &path, basis.snapshot());
             all_recorded &= basis.is_recorded() || observation == Observation::Missing;
@@ -366,10 +376,10 @@ impl Engine {
         Ok(Inspection { situation: Situation { slots }, all_missing, settled })
     }
 
-    /// Run one relation: note replicas, guard the roots, discover, then resolve each key.
+    /// Run a relation: record its replicas, check that its roots are available, discover its keys, then resolve each key.
     fn run_relation(&self, rel: &Relation, replicas: &[Replica]) -> Result<CycleSummary> {
         let mut summary = CycleSummary::default();
-        self.note_replicas(rel, replicas)?;
+        let fresh = self.note_replicas(rel, replicas)?;
         let records = self.store.records_for(&rel.name)?;
         if let Some(reason) = self.unavailable_root(replicas, &records) {
             if self.changed(&rel.name, KEY_ROOT, &reason) {
@@ -390,7 +400,8 @@ impl Engine {
                 self.store.forget(&rel.name, key).with_context(|| format!("forgetting {key} after it left the relation"))?;
             }
         }
-        let full = self.stale_policy.lock().unwrap().contains(&rel.name);
+        let stale = self.stale_policy.lock().unwrap().contains(&rel.name);
+        let full = stale || fresh;
         let unresolved = self.store.unresolved_for(&rel.name)?;
         let names = display_names(replicas);
         let name_of: BTreeMap<&str, &str> = replicas.iter().zip(&names).map(|(r, n)| (r.id(), n.as_str())).collect();
@@ -415,7 +426,7 @@ impl Engine {
                 }
             }
         }
-        if full && !gated {
+        if stale && !gated {
             self.store.set_fingerprint(&rel.name, &rel.fingerprint())?;
             self.stale_policy.lock().unwrap().remove(&rel.name);
         }
@@ -437,7 +448,7 @@ impl Engine {
         }
     }
 
-    /// Decide one key and apply or hold the plan. Returns the number of operations applied.
+    /// Decide a key and apply or hold the plan. Returns the number of operations applied.
     fn resolve_key(&self, rel: &Relation, replicas: &[Replica], key: &Key, records: &RecordMap, unresolved: &BTreeSet<String>, names: &BTreeMap<&str, &str>, full: bool, gated: bool) -> Result<usize> {
         let text = key.to_string();
         let canonical = key.canonical();
@@ -457,7 +468,7 @@ impl Engine {
         let ops = assignment.ops(&insp.situation);
         let held_text = |a: &Assignment| a.held.iter().map(|(id, reason)| format!("{}: {reason}", names.get(id.as_str()).unwrap_or(&id.as_str()))).collect::<Vec<_>>();
         if gated {
-            // Report the held plan once per change of plan or of the content it would copy.
+            // Report the held plan again only when the plan itself or the content behind it changes.
             let plan = describe_plan(names, &ops);
             let reasons = held_text(&assignment);
             let content: Vec<String> = insp.situation.slots.iter().map(|s| match &s.observation {
@@ -509,7 +520,7 @@ impl Engine {
         Ok(n)
     }
 
-    /// Compile the report for each relation, exactly as a cycle would see it, without changing anything.
+    /// Compile the report for each relation from the same inspection a cycle performs, writing nothing.
     pub fn report(&self) -> Report {
         let (expanded, failed) = self.expand_all(None);
         let conflicts = footprint_conflicts(&self.relations, &expanded, &self.reserved);
@@ -537,7 +548,7 @@ impl Engine {
         Report { relations, globally_gated: self.gates.globally_gated() }
     }
 
-    /// The report of one relation.
+    /// Build the report of a relation.
     fn report_relation(&self, rel: &Relation, replicas: &[Replica]) -> Result<RelationReport> {
         let sites = rel.sites.iter().map(|s| {
             let mut notes = Vec::new();
@@ -627,7 +638,7 @@ pub fn transition_of(basis: &Basis, observation: &Observation) -> Transition {
 
 /// Two footprints that overlap, or a footprint that contains or lies inside a reserved path.
 pub struct Conflict {
-    /// Indices into the relation list of the relations involved.
+    /// The index of each involved relation in the engine's relation list.
     pub relations: Vec<usize>,
     pub message: String,
     /// True when a reserved path is involved, which is a configuration error rather than two roots meeting.
@@ -687,11 +698,11 @@ pub struct Report {
     pub globally_gated: bool,
 }
 
-/// One state per relation, ordered worst first so the overall state is the minimum.
+/// The state of a relation. The variants are ordered worst first, so the minimum across relations is the overall state.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RelationState {
     Error,
-    /// A root with records is missing; nothing runs until it returns.
+    /// A root with records is missing, so nothing runs until it comes back.
     Unavailable,
     /// Some keys await a sync.
     Awaiting(usize),
@@ -705,7 +716,7 @@ pub enum RelationState {
 }
 
 impl RelationState {
-    /// One word for JSON consumers.
+    /// The state as a single word, for JSON consumers.
     pub fn word(&self) -> &'static str {
         match self {
             RelationState::Error => "error",
@@ -719,7 +730,7 @@ impl RelationState {
     }
 }
 
-/// The report of one relation.
+/// The report of a relation.
 pub struct RelationReport {
     pub name: String,
     pub sites: Vec<SiteView>,
@@ -732,7 +743,7 @@ pub struct RelationReport {
 }
 
 impl RelationReport {
-    /// Rows awaiting a sync and rows held by a gate. Under a gate only rows with a plan are held; a conflict is awaiting either way.
+    /// Count the rows awaiting a sync and the rows a gate holds. A gate holds only rows with a plan; a conflicted row counts as awaiting whether or not the gate is closed.
     pub fn counts(&self, globally_gated: bool) -> (usize, usize) {
         let gated = globally_gated || self.gated;
         let planned = self.rows.iter().filter(|r| !r.plan.is_empty()).count();
@@ -781,7 +792,7 @@ pub struct ReplicaView {
     pub pattern: String,
 }
 
-/// A key row: one cell per replica, the plan the next cycle applies, the note explaining a hold.
+/// A key row holds a cell for each replica, the plan the next cycle applies, and a note explaining any hold.
 pub struct RowView {
     pub key: String,
     pub cells: Vec<CellView>,
@@ -791,19 +802,19 @@ pub struct RowView {
 }
 
 impl RowView {
-    /// A row needs attention when the next cycle would act on it or a hold keeps it waiting.
+    /// A row needs attention when it carries a plan or a hold keeps it waiting.
     pub fn needs_attention(&self) -> bool {
         !self.plan.is_empty() || self.note.is_some()
     }
 }
 
-/// A cell: what was observed and how it moved since the basis.
+/// A cell: the observation of a replica and its transition since the basis.
 pub struct CellView {
     pub observation: Observation,
     pub transition: Transition,
 }
 
-/// Which kinds the flow carries into a site, for the explain command.
+/// The kinds the flow carries into a site, for the explain command.
 pub fn incoming_kinds(policy: &Policy, site: &str) -> Vec<Kind> {
     Kind::ALL.into_iter().filter(|k| policy.flow.has_incoming(*k, site)).collect()
 }

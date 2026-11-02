@@ -1,4 +1,4 @@
-//! Shell commands the daemon runs on its own events (actions) or on content in transit (transforms), with `${name}` templating, a timeout, captured output.
+//! Shell commands the daemon runs, either on its own events (actions) or on content in transit (transforms). Each command gets `${name}` templating and a timeout, with its output captured for the event that reports the run.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -20,12 +20,12 @@ pub struct Shell {
     pub timeout: Duration,
 }
 
-/// What running a command produced.
+/// The result of a command run: its exit status, whether it timed out, and its output.
 #[derive(Debug)]
 pub struct Outcome {
     pub status: Option<i32>,
     pub timed_out: bool,
-    /// Standard output and standard error, interleaved as they arrived in each stream, output first.
+    /// Standard output followed by standard error, each in the order it arrived.
     pub output: String,
 }
 
@@ -81,7 +81,7 @@ pub fn run(shell: &Shell, cwd: &Path, env: &BTreeMap<String, String>) -> Result<
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("starting `{}`", shell.text))?;
-    // Reading both pipes on threads keeps a chatty command from blocking on a full pipe while the parent waits.
+    // Separate threads drain both pipes, so a chatty command keeps running instead of stalling on a full pipe while the parent waits for it.
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let out = std::thread::spawn(move || { let mut s = String::new(); let _ = stdout.read_to_string(&mut s); s });
@@ -132,6 +132,7 @@ impl Trigger {
         }
     }
 
+    /// The configuration word for the trigger.
     pub fn word(self) -> &'static str {
         match self {
             Trigger::Changed => "changed",
@@ -142,7 +143,7 @@ impl Trigger {
         }
     }
 
-    /// The trigger an event fires, if any. `Changed` is fired by the engine once per cycle rather than from an event.
+    /// The trigger an event fires, if any. The engine fires `Changed` itself once per cycle, since no single event corresponds to it.
     pub fn of(event: &Event) -> Option<Trigger> {
         match event {
             Event::Resolved { ops, .. } if *ops > 0 => Some(Trigger::Resolved),
@@ -154,7 +155,7 @@ impl Trigger {
     }
 }
 
-/// The actions of one relation.
+/// The actions of a relation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Actions {
     pub on: BTreeMap<Trigger, Shell>,
@@ -180,7 +181,7 @@ impl Actions {
     }
 }
 
-/// Run a transform: the command sees `${in}` and `${out}`, must write the output file, must exit zero in time.
+/// Run a transform. The command receives `${in}` and `${out}`. To succeed it has to write the output file and exit zero before the timeout.
 pub fn transform(shell: &Shell, input: &Path, output: &Path, cwd: &Path) -> Result<()> {
     let vars: BTreeMap<String, String> = [("in".to_owned(), input.display().to_string()), ("out".to_owned(), output.display().to_string())].into_iter().collect();
     let text = expand(&shell.text, &vars);
@@ -200,6 +201,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Build a variable map from string pairs.
     fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }

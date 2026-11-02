@@ -1,4 +1,4 @@
-# The live configuration translated to the second design. The daemon under launchd still runs the first design from config.yaml; switch by pointing it here once the state directory below has been created fresh.
+# The live configuration, translated to the second design. The daemon under launchd still runs the first design from config.yaml. To switch, make an empty directory at the state path below, then point the daemon at this file.
 
 state: ~/scripts/replica/live2
 interval: 1m

@@ -1,6 +1,6 @@
-//! Sites, keys, replicas: how a relation's named roles expand into concrete locations and how files are identified across them.
+//! Sites, keys, and replicas. A relation refers to its roles by site name; this module expands each site into concrete locations and identifies the same file across them.
 //!
-//! A site lists one or more patterns. The variables shared by the patterns of all sites of the relation form the key of a file; variables appearing on some sites only fan those sites out into several replicas, one per binding found on disk.
+//! A site lists one or more patterns. The variables common to the patterns of all the sites in the relation make up the key of a file. When a variable appears on only some of the sites, each such site fans out into several replicas, one for each binding found on disk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use crate::medium::{EntryKind, Medium};
 use crate::pattern::{Binding, Pattern, describe_binding};
 
-/// Separator between `name=value` pairs in the canonical text of a key. Values are path text and never contain it.
+/// Separator between `name=value` pairs in the canonical text of a key. A control character is safe here because the values are path text.
 const KEY_SEP: char = '\u{1f}';
 
 /// The identity of a file within a relation: the binding of the identity variables.
@@ -19,7 +19,7 @@ const KEY_SEP: char = '\u{1f}';
 pub struct Key(Binding);
 
 impl Key {
-    /// A key from a full binding, keeping the identity variables alone.
+    /// A key from a full binding, keeping only the identity variables.
     pub fn from_binding(binding: &Binding, identity: &BTreeSet<String>) -> Key {
         Key(binding.iter().filter(|(k, _)| identity.contains(*k)).map(|(k, v)| (k.clone(), v.clone())).collect())
     }
@@ -49,13 +49,13 @@ impl Key {
 }
 
 impl fmt::Display for Key {
-    /// The lone value when the key has one variable, `name=value` pairs otherwise, `(the file)` for the empty key.
+    /// Show the lone value when the key has one variable and `name=value` pairs when it has more. The empty key shows as `(the file)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.is_empty() { f.write_str("(the file)") } else { f.write_str(&describe_binding(&self.0)) }
     }
 }
 
-/// One pattern under a site, with the name a list or map gave it.
+/// A pattern under a site, with a label when the configuration lists several locations for the site.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
     /// The map key or the pattern text as written, when the site lists several locations.
@@ -99,14 +99,14 @@ impl Site {
     }
 }
 
-/// Walk the segments of a pattern below its root, binding each fan-out variable to the directory names found there. Fan-out variables precede identity variables, which the loader checks, so the walk stops at the first identity segment.
+/// Walk the segments of a pattern below its root, binding each fan-out variable to the directory names found at its depth. The loader has already checked that fan-out variables come before identity variables, so the walk can stop after the last fan-out segment.
 fn enumerate_fanout(pattern: &Pattern, fanout: &BTreeSet<String>, medium: &dyn Medium) -> Result<Vec<Binding>> {
     let last_fanout = pattern.var_segments().iter().filter(|(_, v)| fanout.contains(&v.name)).map(|(d, _)| *d).max().unwrap_or(0);
     let mut frontier: Vec<(PathBuf, Binding)> = vec![(pattern.root().to_path_buf(), Binding::new())];
     for depth in 0..=last_fanout {
         let mut next = Vec::new();
         for (dir, binding) in frontier {
-            // A literal segment needs no listing; an entry name is matched when the segment holds a variable.
+            // A literal segment is appended without listing the directory; a variable segment is matched against each entry name.
             if let Some(name) = pattern.segment_literal(depth) {
                 next.push((dir.join(name), binding));
                 continue;
@@ -128,13 +128,13 @@ fn enumerate_fanout(pattern: &Pattern, fanout: &BTreeSet<String>, medium: &dyn M
     Ok(frontier.into_iter().map(|(_, b)| b).collect())
 }
 
-/// A concrete location: a site, a label when the site listed several patterns, the fan-out bindings, the pattern with those bindings applied.
+/// A concrete location. It records the site, a label when the site listed several patterns, the fan-out binding, and the pattern with that binding applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Replica {
     pub site: String,
     pub label: Option<String>,
     pub fanout: Binding,
-    /// The pattern with fan-out variables bound, whose variables are the identity variables alone.
+    /// The pattern after the fan-out variables are bound, so only identity variables remain in it.
     pub pattern: Pattern,
     /// The stable identity under which records are kept: the site, then `[label]`, then `[name=value, ...]` as applicable.
     id: String,
@@ -159,7 +159,7 @@ impl Replica {
         &self.id
     }
 
-    /// The directory the replica's files lie under, or the directory of its one file.
+    /// The directory holding the replica's files, or the parent directory of its single file.
     pub fn root(&self) -> &Path {
         self.pattern.root()
     }
@@ -174,7 +174,7 @@ impl Replica {
         self.pattern.matches(path).map(|b| Key::from_binding(&b, identity))
     }
 
-    /// The qualifier shown after the site name: the fan-out values, else the label, else nothing.
+    /// The qualifier shown after the site name: the fan-out values when there are any, otherwise the label, which may be absent.
     pub fn qualifier(&self) -> Option<String> {
         if !self.fanout.is_empty() {
             Some(self.fanout.values().cloned().collect::<Vec<_>>().join(", "))
@@ -184,7 +184,7 @@ impl Replica {
     }
 }
 
-/// Display names for a list of replicas: the site alone when it has one replica, `site (qualifier)` otherwise, with a path suffix when qualifiers collide.
+/// Display names for a list of replicas. A site with a single replica shows as its bare name. Otherwise the name is `site (qualifier)`, falling back to a path suffix when several siblings share a qualifier.
 pub fn display_names(replicas: &[Replica]) -> Vec<String> {
     replicas.iter().map(|r| {
         let siblings: Vec<&Replica> = replicas.iter().filter(|o| o.site == r.site).collect();
@@ -212,7 +212,7 @@ pub fn display_names(replicas: &[Replica]) -> Vec<String> {
     }).collect()
 }
 
-/// Check the variables of a relation against the identity and fan-out sets the loader derived: within a site each pattern carries the same identity variables, fan-out variables match one segment, fan-out variables come before identity variables.
+/// Check the variables of a relation against the identity and fan-out sets derived by the loader. Each pattern of a site must carry the full set of identity variables; a fan-out variable must match a single segment and must come before any identity variable.
 pub fn validate_vars(sites: &[Site], identity: &BTreeSet<String>, fanout: &BTreeSet<String>) -> Result<()> {
     for site in sites {
         for loc in &site.locations {
@@ -240,7 +240,7 @@ pub fn validate_vars(sites: &[Site], identity: &BTreeSet<String>, fanout: &BTree
     Ok(())
 }
 
-/// Walk a replica for the keys of its files: regular files under the root to the pattern's depth, matched against the pattern, filtered by the ignore globs on their tail.
+/// Walk a replica and collect the keys of its files. The walk visits regular files under the root down to the pattern's depth, drops any whose tail matches an ignore glob, and matches the rest against the pattern.
 pub fn discover_keys(replica: &Replica, identity: &BTreeSet<String>, ignore: &[globset::GlobMatcher], medium: &dyn Medium) -> Result<Discovery> {
     let mut found = Discovery::default();
     let root = replica.root();
@@ -264,7 +264,7 @@ pub fn discover_keys(replica: &Replica, identity: &BTreeSet<String>, ignore: &[g
             let child = rel.join(&entry.name);
             match entry.kind {
                 EntryKind::Dir => {
-                    // Files at depth d+1 are admitted when d+1 <= max_depth, so the walk descends only while that holds.
+                    // Files inside this subdirectory lie at depth+2, so descend only when depth+2 is at most max_depth.
                     if max_depth.is_none_or(|max| depth + 1 < max) {
                         stack.push(child);
                     }
@@ -285,7 +285,7 @@ pub fn discover_keys(replica: &Replica, identity: &BTreeSet<String>, ignore: &[g
     Ok(found)
 }
 
-/// Keys found under a replica plus the subfolders the walk could not read.
+/// Keys found under a replica, along with a message for each unreadable subfolder.
 #[derive(Default, Debug)]
 pub struct Discovery {
     pub keys: BTreeSet<Key>,
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(replicas[1].locate(&key).unwrap(), projects.join("beta/docs/guide.md"));
         assert_eq!(replicas[1].identify(&projects.join("beta/docs/guide.md"), &set(&["path"])), Some(key));
         assert_eq!(display_names(&replicas), vec!["dest (alpha)", "dest (beta)"]);
-        // A site without fan-out variables is one replica with the bare site name.
+        // A site without fan-out variables expands to a single replica, named by the bare site name.
         let plain = site("source", "/u/rules/");
         let one = plain.expand(&set(&["path"]), &Local).unwrap();
         assert_eq!(one.len(), 1);

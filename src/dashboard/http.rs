@@ -1,4 +1,4 @@
-//! A small HTTP/1.1 layer for the loopback dashboard: request heads, responses, loopback and origin checks, URL coding, HTML escaping.
+//! A small HTTP/1.1 layer for the loopback dashboard. It parses request heads, writes responses, checks the Host and Origin headers against loopback, decodes and encodes URL values, escapes HTML, and quotes JSON strings.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -33,7 +33,7 @@ impl Request {
         Some(Request { method, path, query, headers })
     }
 
-    /// Read one request head from a stream within five seconds, however slowly it arrives.
+    /// Read a request head from the stream. The whole head has to arrive within five seconds, however slowly the bytes trickle in.
     pub fn read(stream: &mut TcpStream) -> Option<Request> {
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -97,7 +97,7 @@ impl Response {
         Response::new(status, "text/plain; charset=utf-8", body.into())
     }
 
-    /// The redirect each control endpoint answers with, back to the main page.
+    /// A 303 back to the main page. The control endpoints answer with this after they act.
     pub fn redirect_home() -> Response {
         let mut r = Response::new("303 See Other", "text/plain", "");
         r.extra.push("Location: /".into());
@@ -128,7 +128,7 @@ impl Response {
     }
 }
 
-/// True for the host names the dashboard answers to.
+/// True when the host is localhost or a loopback address, with or without a port.
 pub fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
     let name = if let Some(rest) = host.strip_prefix('[') {
@@ -139,7 +139,7 @@ pub fn is_loopback_host(host: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Whether a POST may act: a loopback Host (no DNS rebinding), an Origin of this dashboard when a browser sends one, no cross-site fetch.
+/// Decide whether a POST may act. The Host has to be loopback, which rules out a DNS rebinding attack. When the browser sends an Origin, that Origin has to match this dashboard's own address and port. When the browser sends Sec-Fetch-Site, the request has to come from this page or straight from the address bar.
 pub fn post_allowed(req: &Request, port: u16) -> Result<(), String> {
     match req.header("host") {
         Some(h) if is_loopback_host(h) => {}
@@ -165,7 +165,7 @@ pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Decode a query string value, working on bytes so a `%` before a multibyte character cannot split it.
+/// Decode a query string value. The loop runs over bytes rather than chars, so a stray `%` right before a multibyte character leaves that character whole.
 pub fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

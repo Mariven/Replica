@@ -1,4 +1,4 @@
-//! The configuration file as typed structures, before validation. Unknown fields are rejected at every level.
+//! The configuration file as typed structures, before validation. Each struct here rejects unknown fields.
 
 use std::collections::BTreeMap;
 
@@ -29,10 +29,10 @@ pub struct FileText {
     pub include: Vec<String>,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
-    /// Profiles stay raw until a relation merges them, so a typo inside one is reported against the profile.
+    /// Profiles stay as raw YAML until a relation merges them in. Their field names are checked on their own first, so a typo inside a profile is reported against that profile.
     #[serde(default)]
     pub profiles: Mapping,
-    /// Relations stay raw until profiles and variables are merged in.
+    /// Relations also stay as raw YAML, since profiles and variables are merged in before the typed form is built.
     #[serde(default)]
     pub relations: Mapping,
 }
@@ -97,10 +97,10 @@ pub struct RelationText {
 
 fn default_true() -> bool { true }
 
-/// The field names a relation accepts, for errors about unknown fields inside profiles.
+/// The fields allowed in a relation body. The profile check uses this list to report an unknown field inside a profile.
 pub const RELATION_FIELDS: [&str; 16] = ["profile", "vars", "each", "sites", "where", "fanout", "flow", "resolve", "ignore", "sync_times", "gate", "watch", "log", "on", "transform", "profiles"];
 
-/// A command as a bare string or as a mapping with its timeout.
+/// A command, written either as a bare string or as a mapping with `run` and `timeout`.
 #[derive(Clone, Debug)]
 pub struct CommandText {
     pub run: String,
@@ -123,7 +123,7 @@ impl<'de> Deserialize<'de> for CommandText {
     }
 }
 
-/// Accept a bare number as well as a string, so `interval: 0` reaches the duration check instead of failing as a type mismatch.
+/// Accept a bare number as well as a string. With this, `interval: 0` is handed to the duration check and rejected there with a clear message, instead of failing earlier as a YAML type mismatch.
 pub fn string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     match Value::deserialize(d)? {
         Value::Null => Ok(None),
@@ -151,7 +151,7 @@ pub fn yaml_kind(v: &Value) -> &'static str {
     }
 }
 
-/// Rename `where_` to `where` on the way in, since `where` is a Rust keyword.
+/// Rename the `where` key to `where_` before deserializing, since `where` is a Rust keyword and the struct field carries the underscore.
 pub fn rename_where(body: &mut Mapping) {
     if let Some(v) = body.remove(Value::String("where".into())) {
         body.insert(Value::String("where_".into()), v);

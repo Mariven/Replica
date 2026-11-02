@@ -183,7 +183,7 @@ fn style_guide_fan_out(rules: &Path, projects_dir: &Path) -> String {
 }
 
 #[test]
-#[ignore = "engine: a fan-out replica discovered after its key settled is never filled; Engine::inspect (src/engine.rs:361-365) counts a replica with no record and no file as at rest, so the key is skipped as settled and the create edge is never consulted"]
+
 fn case_4_discovered_fan_out() {
     let tmp = TempDir::new().unwrap();
     let rules = tmp.path().join("rules");

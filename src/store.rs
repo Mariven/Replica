@@ -1,6 +1,6 @@
-//! The state database: bases per key and replica, unresolved marks, the intent journal, archive rows, persisted settings, relation fingerprints, replica paths.
+//! The state database. It holds the basis of each key at each replica, the unresolved marks, the intent journal, the archive rows, persisted settings, relation fingerprints, and the path behind each replica identity.
 //!
-//! SQLite in write-ahead mode, so dashboard reads never block the engine's writes. Schema version 2; a database from the first design is refused, since its replica identities and record states do not carry over.
+//! SQLite runs in write-ahead mode, so the dashboard can read while the engine writes. The schema is at version 2. A database from the first design is refused, since its replica identities and record states do not carry over.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::site::Key;
 /// Schema version written to the `setting` table when a database is created.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Bases of one relation: by canonical key text, then by replica id.
+/// The bases of a relation, indexed by canonical key text and then by replica id.
 pub type RecordMap = BTreeMap<String, BTreeMap<String, Basis>>;
 
 /// The open database.
@@ -33,7 +33,7 @@ pub fn from_epoch_ms(ms: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
 }
 
-/// Unix seconds now, for `seen` and `started` columns.
+/// The current time in epoch milliseconds, for the `seen` and `started` columns.
 fn now_ms() -> i64 {
     to_epoch_ms(SystemTime::now())
 }
@@ -49,7 +49,16 @@ pub struct ArchiveEntry {
     pub at: SystemTime,
 }
 
-/// An intent row: relation, key, plan text.
+/// What noting a replica's pattern found in the store: nothing yet, the same pattern, or a different one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Noted {
+    New,
+    Same,
+    /// The pattern stored before, which differs from the one noted now.
+    Moved(String),
+}
+
+/// An intent row: the relation and key under a plan, plus the text of the plan.
 pub struct Intent {
     pub relation: String,
     pub key: Key,
@@ -57,7 +66,7 @@ pub struct Intent {
 }
 
 impl Store {
-    /// Open or create the database, creating parent directories, applying the schema, refusing a newer or older schema version.
+    /// Open or create the database. Parent directories are created and the schema is applied; a database at any other schema version is refused.
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -130,7 +139,7 @@ impl Store {
         Ok(Store { conn })
     }
 
-    /// Run `f` inside one transaction, committing on success and rolling back on error.
+    /// Run `f` inside a transaction, committing on success and rolling back on error.
     pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let outcome = f(self).and_then(|v| self.conn.execute_batch("COMMIT").map(|_| v).map_err(Into::into));
@@ -141,7 +150,7 @@ impl Store {
         outcome
     }
 
-    // Settings: gate flags, pause flag, anything else small the daemon persists.
+    // Settings: the gate and pause flags, plus any other small value the daemon persists.
 
     /// Read a setting.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
@@ -178,12 +187,16 @@ impl Store {
     }
 
     /// Record the path behind a replica identity, returning the previously stored path when it differs.
-    pub fn note_replica(&self, relation: &str, id: &str, path: &Path) -> Result<Option<String>> {
+    pub fn note_replica(&self, relation: &str, id: &str, path: &Path) -> Result<Noted> {
         let text = path.display().to_string();
         let previous: Option<String> = self.conn.prepare_cached("SELECT path FROM replica WHERE rel=?1 AND id=?2")?.query_row(params![relation, id], |r| r.get(0)).optional()?;
         self.conn.prepare_cached("INSERT INTO replica (rel, id, path, seen) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (rel, id) DO UPDATE SET path=?3, seen=?4")?
             .execute(params![relation, id, text, now_ms()])?;
-        Ok(previous.filter(|p| *p != text))
+        Ok(match previous {
+            None => Noted::New,
+            Some(p) if p == text => Noted::Same,
+            Some(p) => Noted::Moved(p),
+        })
     }
 
     /// Replica identities with records in a relation.
@@ -193,7 +206,7 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
-    /// Drop the records, unresolved marks, and path of one replica.
+    /// Drop the records, unresolved marks, and stored path of a replica.
     pub fn forget_replica(&self, relation: &str, id: &str) -> Result<usize> {
         let n = self.conn.prepare_cached("DELETE FROM record WHERE rel=?1 AND replica=?2")?.execute(params![relation, id])?;
         self.conn.prepare_cached("DELETE FROM unresolved WHERE rel=?1 AND replica=?2")?.execute(params![relation, id])?;
@@ -203,7 +216,7 @@ impl Store {
 
     // Records.
 
-    /// Load the bases of a relation in one query.
+    /// Load the bases of a relation in a single query.
     pub fn records_for(&self, relation: &str) -> Result<RecordMap> {
         let mut stmt = self.conn.prepare_cached("SELECT key, replica, present, mtime, size, hash FROM record WHERE rel=?1")?;
         let rows = stmt.query_map(params![relation], |r| {
@@ -314,9 +327,9 @@ impl Store {
         Ok((records as u64, intents as u64))
     }
 
-    // Archive rows. The blob store holds the bytes; these rows say which blobs are archived revisions and of what.
+    // Archive rows. The blob store holds the bytes; a row here records the key, replica, path, and reason behind an archived blob.
 
-    /// Insert an archive row, returning its id so eviction can spare it.
+    /// Insert an archive row and return its id, so the caller can exempt the row from eviction.
     pub fn archive_insert(&self, relation: &str, key: &Key, replica: &str, path: &Path, hash: &Hash, size: u64, reason: &str) -> Result<i64> {
         self.conn.prepare_cached(
             "INSERT INTO archive (rel, key, replica, path, hash, size, reason, at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -336,7 +349,7 @@ impl Store {
         Ok((rows as u64, self.archive_unique_bytes()?))
     }
 
-    /// The relation holding the most archived bytes, leaving row `keep` out.
+    /// The relation with the most archived bytes, with row `keep` left out of the count.
     pub fn archive_largest_relation(&self, keep: i64) -> Result<Option<String>> {
         Ok(self.conn.prepare_cached("SELECT rel FROM archive WHERE id<>?1 GROUP BY rel ORDER BY SUM(size) DESC LIMIT 1")?.query_row(params![keep], |r| r.get(0)).optional()?)
     }
@@ -381,6 +394,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A small snapshot whose hash is the given byte repeated.
     fn snap(hash: u8) -> Snapshot {
         Snapshot { mtime: from_epoch_ms(1_700_000_000_000), size: 3, hash: [hash; 32] }
     }
@@ -413,9 +427,9 @@ mod tests {
         assert_eq!(store.fingerprint("r").unwrap(), None);
         store.set_fingerprint("r", "abc").unwrap();
         assert_eq!(store.fingerprint("r").unwrap().as_deref(), Some("abc"));
-        assert_eq!(store.note_replica("r", "dest", Path::new("/a")).unwrap(), None);
-        assert_eq!(store.note_replica("r", "dest", Path::new("/a")).unwrap(), None);
-        assert_eq!(store.note_replica("r", "dest", Path::new("/b")).unwrap().as_deref(), Some("/a"));
+        assert_eq!(store.note_replica("r", "dest", Path::new("/a")).unwrap(), Noted::New);
+        assert_eq!(store.note_replica("r", "dest", Path::new("/a")).unwrap(), Noted::Same);
+        assert_eq!(store.note_replica("r", "dest", Path::new("/b")).unwrap(), Noted::Moved("/a".into()));
         let key = Key::parse("path=f.txt");
         store.write_intent("r", &key, "write dest").unwrap();
         let stale = store.stale_intents().unwrap();

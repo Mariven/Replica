@@ -1,4 +1,4 @@
-//! Load the configuration: parse the YAML, merge includes, assemble each relation from its profiles, expand variables, validate, build the relations the engine runs.
+//! Load the configuration. The loader parses the YAML, merges in included files, assembles each relation from its profiles, expands variables, validates the result, then builds the relations for the engine.
 //!
 //! ```yaml
 //! state: ~/scripts/replica/live
@@ -19,7 +19,7 @@
 //!         flow: "source -> dest [edit create]"
 //! ```
 //!
-//! Path variables in braces belong to patterns; configuration variables are written `${name}` and are expanded first, so the two never collide.
+//! Braced path variables such as `{project}` belong to patterns. Configuration variables are written `${name}` and are expanded before any pattern is parsed, which keeps the two kinds apart.
 
 pub mod merge;
 pub mod text;
@@ -44,7 +44,7 @@ const DEFAULT_ARCHIVE_CAP: &str = "100MB";
 /// Settings resolved from the file.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// The state directory: database, blob store, logs. None when the file sets none, which `check` and `explain` tolerate.
+    /// The state directory, holding the database, the blob store, and the logs. It stays None when the file leaves it out, which `check` and `explain` tolerate.
     pub state: Option<PathBuf>,
     pub interval: Duration,
     pub watch: bool,
@@ -75,15 +75,15 @@ impl Settings {
     }
 }
 
-/// Everything a loaded configuration yields.
+/// The result of loading a configuration.
 pub struct Loaded {
     pub settings: Settings,
     pub relations: Vec<Relation>,
-    /// How each relation was assembled, for the explain command: profile chain and expanded variables.
+    /// Per relation, the profile chain and the expanded variables, kept so the explain command can show them.
     pub provenance: BTreeMap<String, Provenance>,
 }
 
-/// How a relation was assembled.
+/// The profile chain and the expanded variables behind a relation.
 #[derive(Clone, Debug, Default)]
 pub struct Provenance {
     pub profiles: Vec<String>,
@@ -99,7 +99,7 @@ pub fn absolute_path(s: &str, what: &str) -> Result<PathBuf> {
     Ok(p)
 }
 
-/// Parse a duration like `30s`, `1m`, `2h`, `500ms`. Zero is rejected.
+/// Parse a duration like `30s`, `1m`, `2h`, or `500ms`. Zero is rejected.
 pub fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
@@ -140,7 +140,7 @@ fn parse_file(yaml: &str, what: &Path) -> Result<FileText> {
     if yaml.trim().is_empty() {
         return Ok(FileText::default());
     }
-    // Parsing straight into the struct keeps the field path and position in type errors; merge keys need the Value detour.
+    // When the YAML goes straight into the struct, a type error reports the field path and position. Merge keys are not applied on that path, so a file using `<<` is parsed into a Value first.
     if !yaml.contains("<<") {
         return serde_norway::from_str(yaml).with_context(|| format!("parsing {}", what.display()));
     }
@@ -155,7 +155,7 @@ pub fn load_file(path: &Path) -> Result<Loaded> {
     load(&yaml, path)
 }
 
-/// Load configuration text; `path` locates includes and appears in errors.
+/// Load configuration text. Includes are resolved relative to `path`, which also appears in errors.
 pub fn load(yaml: &str, path: &Path) -> Result<Loaded> {
     let mut file = parse_file(yaml, path)?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
@@ -199,7 +199,7 @@ pub fn load(yaml: &str, path: &Path) -> Result<Loaded> {
     Ok(Loaded { settings, relations, provenance })
 }
 
-/// Refuse a profile holding a field no relation accepts, so the typo is reported against the profile rather than the first relation using it.
+/// Refuse a profile with an unknown field. The typo is then reported against the profile itself, instead of against whichever relation happens to use it first.
 fn check_profiles(profiles: &Mapping) -> Result<()> {
     for (k, v) in profiles {
         let name = k.as_str().with_context(|| format!("profile names must be strings, not {}", yaml_kind(k)))?;
@@ -212,10 +212,10 @@ fn check_profiles(profiles: &Mapping) -> Result<()> {
     Ok(())
 }
 
-/// Assemble, expand, validate, and build one relation.
+/// Assemble a relation from its profiles, expand its variables, validate it, then build it.
 fn build_relation(name: &str, body: &Mapping, profiles: &Mapping, scope: &BTreeMap<String, String>, each: &BTreeMap<String, String>, settings: &Settings) -> Result<(Relation, Provenance)> {
     let assembled = merge::assemble(body, profiles)?;
-    // Relation variables live in the assembled body and may themselves refer to the outer scope.
+    // The relation's own `vars` are read from the assembled body, so a profile may supply them. Their values may refer to variables from the outer scope.
     let mut vars = scope.clone();
     vars.insert("relation".into(), name.to_owned());
     vars.extend(each.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -247,7 +247,7 @@ fn build_relation(name: &str, body: &Mapping, profiles: &Mapping, scope: &BTreeM
     Ok((relation, prov))
 }
 
-/// Build the sites of a relation from the `sites` mapping: a pattern, a list of patterns, or a map from replica names to patterns.
+/// Build the sites of a relation from its `sites` mapping. Each entry is a pattern, a list of patterns, or a map from location names to patterns.
 fn build_sites(sites: &Mapping) -> Result<Vec<Site>> {
     let mut out = Vec::new();
     for (k, v) in sites {
@@ -290,7 +290,7 @@ fn build_sites(sites: &Mapping) -> Result<Vec<Site>> {
     Ok(out)
 }
 
-/// Apply the `where` block: each entry constrains a variable on each pattern carrying it.
+/// Apply the `where` block. Each entry adds a constraint to its variable on all of the patterns where that variable appears.
 fn apply_where(sites: &mut [Site], where_: &BTreeMap<String, Value>) -> Result<()> {
     for (var, spec) in where_ {
         let texts: Vec<String> = match spec {
@@ -317,7 +317,7 @@ fn apply_where(sites: &mut [Site], where_: &BTreeMap<String, Value>) -> Result<(
     Ok(())
 }
 
-/// Split variables into identity and fan-out from the declaration, with the errors the design lists.
+/// Sort the variables into identity and fan-out sets according to the `fanout` declaration, reporting the misuses described in the design document.
 fn classify(sites: &[Site], declared: &[String]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let per_site: Vec<(&str, BTreeSet<String>)> = sites.iter().map(|s| (s.name.as_str(), s.var_names())).collect();
     let all: BTreeSet<String> = per_site.iter().flat_map(|(_, v)| v.iter().cloned()).collect();
@@ -355,7 +355,7 @@ fn classify(sites: &[Site], declared: &[String]) -> Result<(BTreeSet<String>, BT
     Ok((identity, fanout))
 }
 
-/// Parse `on` and `transform` commands into shells.
+/// Turn a command from `on` or `transform` into a shell with its timeout.
 fn shell_of(cmd: &CommandText, what: &str) -> Result<Shell> {
     let timeout = match &cmd.timeout {
         Some(t) => parse_duration(t).with_context(|| format!("{what}: timeout"))?,
@@ -422,7 +422,7 @@ fn assemble_relation(name: &str, text: RelationText, settings: &Settings) -> Res
     })
 }
 
-/// The paths the daemon itself writes: database, blob store, logs. A root containing or inside one is refused.
+/// The paths the daemon writes itself: the state directory (database and blob store) and each relation's log file. The caller refuses a site root that contains one of these or lies inside one.
 pub fn reserved_paths(settings: &Settings, relations: &[Relation]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = settings.state.iter().cloned().collect();
     out.extend(relations.iter().filter_map(|r| r.log.clone()));
@@ -523,7 +523,7 @@ mod tests {
         let ok = load_text("relations:\n  r:\n    sites: { source: /rules/main.md, dest: \"/p/{project}/docs/main.md\" }\n    fanout: [project]\n    flow: \"source -> dest\"\n").unwrap();
         assert!(ok.relations[0].identity.is_empty());
         assert_eq!(ok.relations[0].fanout, BTreeSet::from(["project".to_string()]));
-        // The slash slip gets its hint.
+        // A file pattern on one site and a folder pattern on the other gets the trailing-slash hint.
         let err = load_err("relations:\n  r:\n    sites: { source: /a, dest: /b/ }\n    flow: \"source <-> dest\"\n");
         assert!(err.contains("trailing slash"), "{err}");
         let err = load_err("relations:\n  r:\n    sites: { source: /a/, dest: /b/ }\n    fanout: [zzz]\n    flow: \"source <-> dest\"\n");

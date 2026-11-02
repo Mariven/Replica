@@ -1,4 +1,4 @@
-//! Composition of the configuration: variables written `${name}`, profiles deep-merged into relations, included files, relations stamped out by `each`.
+//! Compose the configuration. This module expands `${name}` variables, deep-merges profiles into relation bodies, resolves and merges included files, and stamps out a relation per combination of `each` values.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -6,17 +6,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_norway::{Mapping, Value};
 
-/// Expand `${name}` references in a string against a scope, following references inside values and refusing cycles. Unknown names are errors.
+/// Expand the `${name}` references in a string against a scope. A variable's value may hold references of its own, which are expanded in turn. A cycle or an unknown name is an error.
 pub fn expand_vars(text: &str, scope: &BTreeMap<String, String>) -> Result<String> {
     expand_with_stack(text, scope, false, &mut Vec::new())
 }
 
-/// Expand known `${name}` references and leave unknown ones as written, for command strings whose remaining placeholders are filled when the command runs.
+/// Expand the known `${name}` references and leave unknown ones as written. Command strings are expanded this way, since their remaining placeholders are filled in when the command runs.
 pub fn expand_vars_lenient(text: &str, scope: &BTreeMap<String, String>) -> Result<String> {
     expand_with_stack(text, scope, true, &mut Vec::new())
 }
 
-/// The recursive worker behind expand_vars; `stack` holds the variables being expanded, for cycle detection.
+/// The recursive worker behind expand_vars. `stack` lists the variables currently being expanded, so meeting one of them again means a cycle.
 fn expand_with_stack(text: &str, scope: &BTreeMap<String, String>, lenient: bool, stack: &mut Vec<String>) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -46,7 +46,7 @@ fn expand_with_stack(text: &str, scope: &BTreeMap<String, String>, lenient: bool
     Ok(out)
 }
 
-/// Fields of a relation body whose strings are commands, where unknown placeholders are left for run time.
+/// The relation fields holding commands. Unknown placeholders under these are left in place for run time.
 const COMMAND_FIELDS: [&str; 2] = ["on", "transform"];
 
 /// Expand variables in each string of a YAML value, including mapping keys. Strings under `on` and `transform` keep unknown placeholders.
@@ -77,7 +77,7 @@ fn expand_inner(v: &Value, scope: &BTreeMap<String, String>, lenient: bool) -> R
     })
 }
 
-/// Deep-merge `over` into `base`: a mapping adds or replaces keys inside a mapping; anything else replaces the earlier value.
+/// Deep-merge `over` into `base`. When both are mappings, each key of `over` is added to `base` or merged into the matching key there. Any other kind of value in `over` replaces the value in `base` outright.
 pub fn deep_merge(base: &mut Value, over: &Value) {
     match (base, over) {
         (Value::Mapping(b), Value::Mapping(o)) => {
@@ -93,7 +93,7 @@ pub fn deep_merge(base: &mut Value, over: &Value) {
 }
 
 /// Assemble a relation body from its profiles: the profile `_` when present, then each listed profile in order, then the body itself.
-/// A profile may list profiles of its own, which are merged first. A profile referenced twice along a chain is an error.
+/// A profile may list profiles of its own, which are merged before it. The chain is refused when it comes back around to a profile already on it.
 pub fn assemble(body: &Mapping, profiles: &Mapping) -> Result<Mapping> {
     let mut out = Value::Mapping(Mapping::new());
     if let Some(defaults) = profiles.get("_") {
@@ -112,7 +112,7 @@ pub fn assemble(body: &Mapping, profiles: &Mapping) -> Result<Mapping> {
     }
 }
 
-/// Merge one profile (and the profiles it lists) into the body under assembly.
+/// Merge a profile into the body under assembly. Any profiles listed inside it are merged first.
 fn merge_profile(name: &str, profile: &Value, profiles: &Mapping, out: &mut Value, chain: &mut Vec<String>) -> Result<()> {
     let Value::Mapping(map) = profile else { bail!("profile {name:?} must be a mapping of relation fields") };
     for sub in listed_profiles(map)? {
@@ -130,7 +130,7 @@ fn merge_profile(name: &str, profile: &Value, profiles: &Mapping, out: &mut Valu
     Ok(())
 }
 
-/// The profiles a body lists under `profile`: a string or a list of strings.
+/// Read the `profile` field of a body, which may be a string or a list of strings.
 fn listed_profiles(body: &Mapping) -> Result<Vec<String>> {
     Ok(match body.get("profile") {
         None | Some(Value::Null) => Vec::new(),
@@ -140,7 +140,7 @@ fn listed_profiles(body: &Mapping) -> Result<Vec<String>> {
     })
 }
 
-/// Stamp a relation out once per combination of its `each` values. Each copy is called `name-value...` and sees the values as variables.
+/// Stamp a relation out once per combination of its `each` values. A copy's name is the relation name with its values appended, as in `rules-alpha-x`. The copy also gets those values as variables.
 pub fn stamp(name: &str, body: &Mapping) -> Result<Vec<(String, Mapping, BTreeMap<String, String>)>> {
     let each: BTreeMap<String, Vec<String>> = match body.get("each") {
         None | Some(Value::Null) => BTreeMap::new(),
@@ -164,7 +164,7 @@ pub fn stamp(name: &str, body: &Mapping) -> Result<Vec<(String, Mapping, BTreeMa
     }).collect())
 }
 
-/// Resolve an include entry to files: a path, or a glob over one directory's entries, relative to the including file's directory.
+/// Resolve an include entry to a list of files. The entry is either a path or a glob over the entries of a single directory. A relative entry is resolved against the including file's directory.
 pub fn included_files(entry: &str, base: &Path) -> Result<Vec<PathBuf>> {
     let expanded = shellexpand::tilde(entry).into_owned();
     let path = if Path::new(&expanded).is_absolute() { PathBuf::from(&expanded) } else { base.join(&expanded) };
@@ -190,10 +190,10 @@ pub fn included_files(entry: &str, base: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Merge the vars, profiles, and relations of an included file into the main ones, refusing a name defined in both.
+/// Merge the vars, profiles, relations, and ignore list of an included file into the main file. When both files define the same name, the merge fails.
 pub fn merge_included(main: &mut super::text::FileText, other: super::text::FileText, main_path: &Path, other_path: &Path) -> Result<()> {
     if other.state.is_some() || other.interval.is_some() || other.dashboard.is_some() || !other.include.is_empty() {
-        bail!("included file {} may define vars, profiles, relations, and ignore alone", other_path.display());
+        bail!("included file {} may only set vars, profiles, relations, and ignore", other_path.display());
     }
     for (k, v) in other.vars {
         if main.vars.contains_key(&k) {
@@ -217,7 +217,7 @@ pub fn merge_included(main: &mut super::text::FileText, other: super::text::File
     Ok(())
 }
 
-/// The field names a relation body may contain, for checking profiles before they merge.
+/// The keys of a body that fall outside `allowed`. The profile check runs this on each profile before any relation merges it in.
 pub fn unknown_fields(body: &Mapping, allowed: &[&str]) -> BTreeSet<String> {
     body.keys().filter_map(|k| k.as_str()).filter(|k| !allowed.contains(k)).map(str::to_owned).collect()
 }
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(out.get("flow").unwrap().as_str(), Some("a <-> b"));
         assert_eq!(out.get("resolve").unwrap().as_str(), Some("a > b"), "the listing profile overrides the one it lists");
         assert_eq!(out.get("log").unwrap().as_str(), Some("default.log"));
-        assert_eq!(out.get("sync_times").unwrap().as_bool(), Some(true), "the body wins over every profile");
+        assert_eq!(out.get("sync_times").unwrap().as_bool(), Some(true), "the body wins over all of its profiles");
         assert!(out.get("profile").is_none());
         let err = assemble(&yaml("profile: nope\n"), &profiles).unwrap_err().to_string();
         assert!(err.contains("profile \"nope\" is not defined"), "{err}");

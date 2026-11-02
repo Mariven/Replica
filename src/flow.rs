@@ -1,24 +1,36 @@
-//! The flow of a relation: which kinds of transition travel between which sites, and how disagreements are settled.
+//! The flow and resolver of a relation. Flow statements draw arrows between sites and label each arrow with the kinds of transition passing along it. Resolver statements settle disagreements between sites.
 //!
-//! Flow statements are separated by `;`. Each relates a site or a braced set to another through an arrow with the carried kinds in brackets:
+//! Semicolons separate flow statements. Each one joins a site, or a braced set of sites, to another by an arrow, with the carried kinds in brackets:
 //!
-//!     source <-> dest [edit create]
-//!     source -> dest [all]
-//!     {a, b} -> c [edit]
-//!     backup <- source
+//! ```text
+//! source <-> dest [edit create]
+//! source -> dest [all]
+//! {a, b} -> c [edit]
+//! backup <- source
+//! ```
 //!
-//! An arrow without brackets carries `edit` and `create`. Carriage is transitive per kind.
-//! Resolver statements are `a > b` (a wins), `a < b`, `a mtime b` (newer wins), `a size b` (larger wins), `a name b` (alphabetically earlier file name wins), or a bare property for all pairs. Rules apply in order; a property tie falls through to the next rule.
+//! An arrow without brackets carries `edit` and `create`. Arrows of the same kind chain together: if a carries edits to b and b carries edits to c, then a carries edits to c.
+//!
+//! Resolver statements pick a winner when two sites disagree:
+//!
+//! ```text
+//! a > b
+//! a mtime b
+//! size
+//! ```
+//!
+//! `a > b` says content from a wins over content from b; `a < b` says the reverse. `a mtime b` picks the newer file. `a size b` picks the larger file. `a name b` picks the file with the alphabetically earlier name.
+//! A bare property such as `size` applies to any pair of sites. The rules are tried in order. When a property compares equal, the next rule gets its turn.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use anyhow::{Result, bail};
 
-/// The kinds of transition an edge can carry.
+/// A kind of transition. Each edge carries some subset of these.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
-    /// Content to a replica that already holds the file.
+    /// New content for a replica already holding the file.
     Edit,
     /// Content to a replica missing the file, including a restore after a deletion there.
     Create,
@@ -49,7 +61,7 @@ impl Kind {
     }
 }
 
-/// A directed edge between two sites with the kinds it carries.
+/// A directed edge from one site to another, together with its kinds.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Edge {
     pub from: String,
@@ -61,7 +73,7 @@ pub struct Edge {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Flow {
     edges: Vec<Edge>,
-    /// For each kind, the sites each site can carry that kind to, through any number of edges.
+    /// Per kind, the transitive closure of the edges of that kind, as a map from a site to the sites downstream of it.
     reach: BTreeMap<Kind, BTreeMap<String, BTreeSet<String>>>,
 }
 
@@ -99,7 +111,7 @@ impl Flow {
         Ok(flow)
     }
 
-    /// Compute, per kind, which sites each site can carry that kind to.
+    /// Fill `reach` by walking the edges of each kind outward from each source site.
     fn close(&mut self) {
         for kind in Kind::ALL {
             let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -140,7 +152,7 @@ impl Flow {
         self.edges.iter().flat_map(|e| [e.from.as_str(), e.to.as_str()]).collect()
     }
 
-    /// The sites each site can carry `kind` to, for the explain command.
+    /// The closure for `kind`, mapping each site to the sites downstream of it. The explain command prints this.
     pub fn closure(&self, kind: Kind) -> &BTreeMap<String, BTreeSet<String>> {
         self.reach.get(&kind).expect("closure is computed for each kind")
     }
@@ -233,7 +245,7 @@ impl Property {
     }
 }
 
-/// One resolver rule.
+/// A resolver rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rule {
     /// Content from `winner` beats content from `loser`.
@@ -327,7 +339,7 @@ impl Policy {
         Ok(Policy { flow: Flow::parse(flow)?, resolve: parse_rules(resolve)? })
     }
 
-    /// A stable text of the policy, hashed into the relation fingerprint so a policy change forces full re-evaluation.
+    /// A stable text of the policy. The relation fingerprint is a hash over this text, so the daemon re-evaluates all keys after a policy change.
     pub fn fingerprint_text(&self) -> String {
         let rules: Vec<String> = self.resolve.iter().map(|r| r.to_string()).collect();
         format!("{} ; resolve: {}", self.flow, rules.join("; "))
@@ -355,7 +367,7 @@ enum Tok {
     Word(String),
 }
 
-/// Tokenize a statement. Words absorb any character outside whitespace, braces, brackets, commas, arrows, comparison signs.
+/// Tokenize a statement. A word runs until whitespace, a brace, a bracket, a comma, an arrow, or a comparison sign.
 fn tokenize(s: &str) -> Vec<Tok> {
     let mut toks = Vec::new();
     let mut rest = s;

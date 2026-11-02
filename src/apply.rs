@@ -1,7 +1,12 @@
-//! The executor: turn an assignment for one key into filesystem changes and committed records.
+//! The executor. It carries out the assignment for a key: first the filesystem changes, then the committed records.
 //!
-//! Stages run in order, each able to fail before the next starts: stage the content the plan needs into the blob store, archive what will be overwritten or deleted, journal the intent and place markers, write and delete through the medium, commit the records in one transaction.
-//! A failure removes the markers and the intent row and leaves the records alone, so the next cycle plans again from the last consistent basis.
+//! The work runs in stages. A failure in any stage stops the rest:
+//!     1. stage the content the plan needs into the blob store;
+//!     2. archive the files about to be overwritten or deleted;
+//!     3. journal the intent and place the markers;
+//!     4. write and delete through the medium;
+//!     5. commit the records in a single transaction.
+//! When a stage fails, the executor removes the markers and the intent row but leaves the records as they were, so on the next cycle the planner starts again from the last consistent basis.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +22,7 @@ use crate::observe::{Basis, Hash, Observation, Snapshot, hex};
 use crate::site::{Key, Replica};
 use crate::store::Store;
 
-/// Everything the executor needs about the relation and key it applies to.
+/// The setting of a plan: its relation, key, replicas, observed situation, and the options in force.
 pub struct Context<'a> {
     pub relation: &'a str,
     pub key: &'a Key,
@@ -25,30 +30,30 @@ pub struct Context<'a> {
     pub situation: &'a Situation,
     /// Copy the proposing replica's modification time onto written files.
     pub sync_times: bool,
-    /// Commands rewriting content on the way from one site to another, keyed by (from site, to site).
+    /// Transform commands, keyed by (from site, to site). Each rewrites content on its way from the first site to the second.
     pub transforms: &'a BTreeMap<(String, String), Shell>,
     /// Working directory for transform commands.
     pub workdir: &'a Path,
 }
 
-/// What a plan did.
+/// The result of applying a plan.
 #[derive(Debug, Default)]
 pub struct Applied {
     pub ops: Vec<Op>,
-    /// Paths written or deleted, for actions.
+    /// The paths written or deleted, handed to the actions afterward.
     pub paths: Vec<PathBuf>,
-    /// Non-fatal problems, such as a permission bit that could not be set.
+    /// Non-fatal problems, such as a failure to set permission bits.
     pub warnings: Vec<String>,
 }
 
-/// The executor over one store, blob store, medium.
+/// The executor, bound to a state database, a blob store, and a medium.
 pub struct Executor<'a> {
     pub store: &'a Store,
     pub blobs: &'a Blobs,
     pub medium: &'a dyn Medium,
 }
 
-/// Bytes a write takes: the blob hash plus the mode and mtime of the replica the content came from.
+/// Where a write draws its content: the blob hash and size, plus the mode and mtime found at the donor replica.
 struct Source {
     hash: Hash,
     size: u64,
@@ -56,7 +61,7 @@ struct Source {
     mode: Option<u32>,
 }
 
-/// Markers placed for the duration of a plan, removed on success and on failure alike.
+/// The marker files kept while a plan applies. When this value is dropped, the markers are removed, whether the plan succeeded or failed.
 struct Markers<'a> {
     medium: &'a dyn Medium,
     paths: Vec<PathBuf>,
@@ -71,7 +76,7 @@ impl Drop for Markers<'_> {
 }
 
 impl Executor<'_> {
-    /// Apply an assignment. Operations are derived from the assignment against the situation's observations.
+    /// Apply an assignment. The operations come from comparing the assignment with the situation's observations.
     pub fn apply(&self, ctx: &Context, assignment: &Assignment) -> Result<Applied> {
         let ops = assignment.ops(ctx.situation);
         let replicas: BTreeMap<&str, &Replica> = ctx.replicas.iter().map(|r| (r.id(), r)).collect();
@@ -79,7 +84,7 @@ impl Executor<'_> {
         let replica = |id: &str| replicas.get(id).copied().with_context(|| format!("plan refers to unknown replica {id:?}"));
         let slot = |id: &str| slots.get(id).copied().with_context(|| format!("plan refers to unknown replica {id:?}"));
 
-        // Stage 1: bring the content of each write into the blob store, from a replica holding it or from the store itself, applying transforms along the way.
+        // Stage 1: make sure the blob store holds the content of each write. Unless the store already has the blob, the bytes are read from a replica observed with that hash. When a transform is configured for the edge, the transform's output is staged too and becomes the source of the write.
         let mut staged: BTreeSet<Hash> = BTreeSet::new();
         let mut sources: BTreeMap<String, Source> = BTreeMap::new();
         for op in &ops {
@@ -133,7 +138,7 @@ impl Executor<'_> {
             markers.paths.push(marker_path(&target));
         }
 
-        // Stage 4: write and delete. Outcomes start from the observations so untouched replicas commit what was seen.
+        // Stage 4: write and delete. The outcome table is seeded from the observations before any op runs, so in stage 5 the observed state of replicas outside the plan is committed as well.
         let mut outcomes: BTreeMap<&str, Basis> = ctx.situation.slots.iter().map(|s| (s.id.as_str(), outcome_of(s))).collect();
         let mut applied = Applied::default();
         let executed: Result<()> = (|| {
@@ -143,7 +148,7 @@ impl Executor<'_> {
                         let target = slot(to)?;
                         let path = replica(to)?.locate(ctx.key)?;
                         let src = &sources[to.as_str()];
-                        // A new file takes the source's permission bits; an overwrite keeps the target's own, as cp does.
+                        // A new file gets the source's permission bits. An overwrite keeps the bits already on the target, as cp does.
                         let mode = match &target.observation {
                             Observation::Missing => src.mode,
                             _ => self.medium.stat(&path).ok().flatten().map(|m| m.mode).or(src.mode),
@@ -188,7 +193,7 @@ impl Executor<'_> {
         drop(markers);
         self.sweep(&staged);
         if let Err(e) = committed {
-            // The files are written and the error is reported with its cause, so the journal row must not read as a crash at the next start.
+            // The files are already in place, so the caller gets the error with its cause. The journal row is removed too, since at startup a leftover intent row is read as an unfinished plan.
             let _ = self.store.clear_intent(ctx.relation, ctx.key);
             return Err(e);
         }
@@ -196,7 +201,7 @@ impl Executor<'_> {
         Ok(applied)
     }
 
-    /// Make sure a hash is in the blob store: read it from the proposing replica, else from any replica holding it, else trust the store.
+    /// Make sure the blob store holds the content behind a hash and return its size. When the blob is already in the store, nothing is read. Otherwise the proposing replica is read first, then any other replica observed with the same hash.
     fn stage_hash(&self, hash: &Hash, from: &str, donor_path: &Path, slots: &BTreeMap<&str, &Slot>, replicas: &BTreeMap<&str, &Replica>, key: &Key, staged: &mut BTreeSet<Hash>) -> Result<u64> {
         if staged.contains(hash) || self.blobs.has(hash) {
             return Ok(self.medium.stat(donor_path).ok().flatten().map(|m| m.size).unwrap_or_else(|| slots.get(from).and_then(|s| s.observation.snapshot()).map(|s| s.size).unwrap_or(0)));
@@ -220,14 +225,14 @@ impl Executor<'_> {
                 staged.insert(got);
                 return Ok(size);
             }
-            // The file changed between observation and read; another holder may still carry the agreed content.
+            // The file changed between the observation and this read. Another holder may still have the agreed content, so the loop goes on.
             staged.insert(got);
             last_error = Some(anyhow::anyhow!("{} changed while the plan was being applied (expected {}, read {})", path.display(), hex(hash), hex(&got)));
         }
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no replica holds content {}", hex(hash))))
     }
 
-    /// Run a transform over a staged blob, staging its output, and describe the result as the write's source.
+    /// Run a transform over a staged blob, stage its output, and return that output as the source of the write.
     fn transform(&self, shell: &Shell, input: &Hash, workdir: &Path, staged: &mut BTreeSet<Hash>) -> Result<Source> {
         let output = self.blobs.dir.join(format!(".transform-{}-{}", std::process::id(), hex(input)));
         let result = transform(shell, &self.blobs.path(input), &output, workdir).and_then(|()| {
@@ -240,7 +245,7 @@ impl Executor<'_> {
         Ok(Source { hash, size, mtime: SystemTime::now(), mode: None })
     }
 
-    /// Save a file about to be overwritten or deleted into the blob store with an archive row, then evict past the cap.
+    /// Save a file about to be overwritten or deleted: stage it into the blob store, insert an archive row, then evict old revisions until the archive fits under its cap.
     fn archive(&self, relation: &str, key: &Key, id: &str, path: &Path, snap: &Snapshot, reason: &str) -> Result<()> {
         let mut reader = match self.medium.open(path) {
             Ok(r) => r,
@@ -265,7 +270,7 @@ impl Executor<'_> {
         self.medium.put(&marker_path(target), text.as_bytes()).with_context(|| format!("writing marker beside {}", target.display()))
     }
 
-    /// Remove staged blobs no archive row refers to.
+    /// Remove the staged blobs from disk, skipping any blob with an archive row behind it.
     fn sweep(&self, staged: &BTreeSet<Hash>) {
         for hash in staged {
             let _ = self.blobs.sweep(self.store, hash);
@@ -273,7 +278,7 @@ impl Executor<'_> {
     }
 }
 
-/// The basis a replica commits when no operation touches it: what was observed, a tombstone where a recorded snapshot is gone, no record where there never was one.
+/// The basis for a replica outside the plan. If the file is present, its observed snapshot becomes the basis. A recorded snapshot found missing turns into a tombstone. A replica with no record and no file stays without a record.
 fn outcome_of(slot: &Slot) -> Basis {
     match (&slot.basis, &slot.observation) {
         (_, Observation::Present(s)) => Basis::Snapshot(s.clone()),
@@ -292,7 +297,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    /// Observe a path for a test: hash present files, mark missing ones.
+    /// Observe a path for a test, hashing a present file and reporting a missing one as such.
     fn observe(path: &Path) -> Observation {
         match fs::read(path) {
             Ok(bytes) => Observation::Present(Snapshot { mtime: fs::metadata(path).unwrap().modified().unwrap(), size: bytes.len() as u64, hash: *blake3::hash(&bytes).as_bytes() }),
@@ -300,6 +305,7 @@ mod tests {
         }
     }
 
+    /// Open a store and blob store under the temp dir, with replicas a, b, c in sibling directories.
     fn setup(tmp: &TempDir) -> (Store, Blobs, Vec<Replica>) {
         let store = Store::open(&tmp.path().join("state.db")).unwrap();
         let blobs = Blobs { dir: tmp.path().join("blobs"), cap: 1 << 20 };
@@ -307,6 +313,7 @@ mod tests {
         (store, blobs, replicas)
     }
 
+    /// Build the situation of a key in relation "r": each replica's recorded basis next to a fresh observation of its file.
     fn situation(replicas: &[Replica], key: &Key, store: &Store) -> Situation {
         let records = store.records_for("r").unwrap();
         Situation { slots: replicas.iter().map(|r| {
@@ -328,7 +335,7 @@ mod tests {
         fs::write(tmp.path().join("b/f.txt"), "from b").unwrap();
         fs::write(tmp.path().join("c/f.txt"), "old").unwrap();
         let sit = situation(&replicas, &key, &store);
-        // b takes a's content while c takes b's old content: the plan names hashes, so the order of writes does not matter.
+        // b receives a's content and c receives b's old content. The plan refers to content by hash, so the order of the writes does not matter.
         let policy = Policy::parse("a -> b [edit]; {a, b} -> c [edit]", "b > a").unwrap();
         let assignment = crate::decide::decide(&policy, &sit);
         let exec = Executor { store: &store, blobs: &blobs, medium: &Local };
@@ -337,7 +344,7 @@ mod tests {
         assert_eq!(applied.ops.len(), 2);
         assert_eq!(fs::read_to_string(tmp.path().join("b/f.txt")).unwrap(), "from a");
         assert_eq!(fs::read_to_string(tmp.path().join("c/f.txt")).unwrap(), "from b");
-        // Overwritten content is archived; records hold the new hashes; no intent or marker remains.
+        // The overwritten content is in the archive, the records hold the new hashes, and the intent row and markers are gone.
         let archived = store.archive_entries("r").unwrap();
         assert_eq!(archived.len(), 2);
         assert!(store.stale_intents().unwrap().is_empty());

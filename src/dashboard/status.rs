@@ -1,4 +1,4 @@
-//! The body of `status.json`: process state, gate, counters, timing, the watch state, one entry per relation.
+//! The body of `status.json`. It carries the process state, the gate, counters, timing, the watch state, and an entry per relation.
 
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -14,7 +14,7 @@ pub fn epoch_secs(t: SystemTime) -> i64 {
     to_epoch_ms(t) / 1000
 }
 
-/// Rows awaiting sync and rows held by a gate across relations.
+/// Rows awaiting sync and rows held by a gate, summed over all relations.
 pub fn totals(report: &Report) -> (usize, usize) {
     report.relations.iter().map(|r| r.counts(report.globally_gated)).fold((0, 0), |(a, h), (x, y)| (a + x, h + y))
 }

@@ -1,4 +1,4 @@
-//! Filesystem change notification feeding the main loop. The periodic scan stays the source of truth; an event only marks a relation dirty so a cycle over the dirty relations runs sooner.
+//! Filesystem change notifications for the main loop. The periodic scan remains authoritative. A notification only marks a relation dirty, so the main loop runs a cycle over the dirty relations sooner than the next scheduled scan.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -12,21 +12,21 @@ use crate::engine::Relation;
 use crate::medium::Medium;
 use crate::site::Replica;
 
-/// Something the watcher wants the main loop to know.
+/// A message from the watcher to the main loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notice {
-    /// A path under a watched root changed; the relations whose roots contain it are listed.
+    /// A path under a watched root changed. `relations` lists the relations whose roots contain it.
     Changed { relations: Vec<String>, path: PathBuf },
 }
 
-/// The roots registered with the operating system and which relations each belongs to.
+/// The roots registered with the operating system, each with the relations it belongs to.
 #[derive(Default)]
 struct Roots {
     by_root: BTreeMap<PathBuf, BTreeSet<String>>,
 }
 
 impl Roots {
-    /// Relations whose registered roots contain the path, nearest root first.
+    /// The relations whose registered roots contain the path, in name order.
     fn relations_for(&self, path: &Path) -> Vec<String> {
         let mut out = BTreeSet::new();
         for (root, relations) in &self.by_root {
@@ -45,13 +45,13 @@ pub struct Watch {
 }
 
 impl Watch {
-    /// Register the roots of each watched relation's replicas, plus the directories fan-out variables are enumerated from, and send a notice per event.
+    /// Start watching. For each watched relation this registers the roots of its replicas and the directories where fan-out variables are enumerated. Each filesystem event under those roots produces a notice on `tx`.
     pub fn start(relations: &[Relation], medium: &dyn Medium, tx: Sender<Notice>) -> Result<Watch> {
         let roots = Arc::new(Mutex::new(Roots::default()));
         let shared = roots.clone();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             let Ok(event) = event else { return };
-            // Access events carry no change; anything else may.
+            // Access events carry no change. Any other kind may.
             if matches!(event.kind, notify::EventKind::Access(_)) {
                 return;
             }
@@ -68,7 +68,7 @@ impl Watch {
             for root in watch_roots(rel, medium) {
                 roots.lock().unwrap().by_root.entry(root.clone()).or_default().insert(rel.name.clone());
                 if registered.insert(root.clone()) && medium.is_dir(&root) {
-                    // A root that does not exist yet is skipped; the periodic scan still finds it once it appears.
+                    // A root that does not exist yet is left unregistered. The periodic scan picks it up once it appears.
                     if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
                         eprintln!("watch: cannot watch {}: {e}", root.display());
                     }
@@ -84,7 +84,7 @@ impl Watch {
     }
 }
 
-/// The directories to watch for a relation: each replica's root, and for fan-out patterns the pattern root where new replicas appear.
+/// The directories to watch for a relation: each replica's root, plus, for a fan-out pattern, the pattern root where new replicas appear.
 pub fn watch_roots(rel: &Relation, medium: &dyn Medium) -> Vec<PathBuf> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     for site in &rel.sites {

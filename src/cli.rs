@@ -1,4 +1,4 @@
-//! The command line: subcommands, their arguments, and the ones that run without a daemon (check, explain, plan, forget) or talk to one over its dashboard port.
+//! The command line. This module parses the subcommands with their arguments and carries out all of them except run. Check, explain, plan, and forget read the configuration alone. Status, history, and the control commands talk to a running daemon over its dashboard port.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -46,7 +46,7 @@ pub enum Command {
     Version,
 }
 
-/// Where to find the daemon: a port, or a config file whose dashboard setting has it.
+/// How to find the daemon: by a port number given directly, or by reading the dashboard port out of a config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Port {
     Number(u16),
@@ -157,7 +157,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
     })
 }
 
-/// Load the configuration and run the static checks, as startup does. Reserved-path problems are fatal; others are returned.
+/// Load the configuration and run the static checks, as startup does. A problem with a reserved path is fatal. Any other problems come back as messages for the caller to print.
 pub fn load_checked(path: &Path) -> Result<(Loaded, Vec<String>)> {
     let loaded = config::load_file(path)?;
     engine::ensure_relations(&loaded.relations)?;
@@ -182,7 +182,7 @@ pub fn check(path: &Path) -> Result<i32> {
     Ok(1)
 }
 
-/// Pick the relations a subcommand works on.
+/// Pick the relations for a subcommand: all of them, or the single named one.
 fn select<'a>(loaded: &'a Loaded, relation: Option<&str>) -> Result<Vec<&'a engine::Relation>> {
     match relation {
         None => Ok(loaded.relations.iter().collect()),
@@ -196,7 +196,7 @@ fn select<'a>(loaded: &'a Loaded, relation: Option<&str>) -> Result<Vec<&'a engi
     }
 }
 
-/// The explain subcommand: print how each relation resolves.
+/// The explain subcommand: print the resolved form of each relation, with its profiles, variables, patterns, replicas, and flow.
 pub fn explain(path: &Path, relation: Option<&str>) -> Result<String> {
     let loaded = config::load_file(path)?;
     let mut out = String::new();
@@ -284,7 +284,7 @@ fn open_engine(loaded: Loaded) -> Result<Engine> {
     Ok(eng)
 }
 
-/// The plan subcommand: what the next cycle would do, from the report.
+/// The plan subcommand: print the pending operations of each relation, read from the engine's report, without applying any of them.
 pub fn plan(path: &Path, relation: Option<&str>) -> Result<String> {
     let loaded = config::load_file(path)?;
     let only: Option<BTreeSet<String>> = relation.map(|r| BTreeSet::from([r.to_owned()]));
@@ -323,7 +323,7 @@ pub fn plan(path: &Path, relation: Option<&str>) -> Result<String> {
     Ok(out)
 }
 
-/// The forget subcommand: drop the records of one replica.
+/// The forget subcommand: drop the stored records of a single replica.
 pub fn forget(path: &Path, relation: &str, replica: &str) -> Result<String> {
     let loaded = config::load_file(path)?;
     select(&loaded, Some(relation))?;
@@ -336,7 +336,7 @@ pub fn forget(path: &Path, relation: &str, replica: &str) -> Result<String> {
     Ok(format!("forgot {} of {relation}/{replica}", crate::dashboard::plural(n, "record")))
 }
 
-/// Send one request to the daemon and return the body.
+/// Send a request to the daemon and return the status code with the body.
 fn request(port: u16, method: &str, path: &str) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(3)).with_context(|| format!("no replica answering on port {port}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -358,7 +358,7 @@ pub fn control(port: &Port, path: &str) -> Result<String> {
     Ok(format!("ok: {path}"))
 }
 
-/// Fetch status.json, or render it in words.
+/// Fetch status.json from the daemon, raw with --json or summarized for the terminal.
 pub fn status(port: &Port, json: bool) -> Result<String> {
     let port = port.resolve()?;
     let (status, body) = request(port, "GET", "/status.json")?;
@@ -368,7 +368,7 @@ pub fn status(port: &Port, json: bool) -> Result<String> {
     if json {
         return Ok(body);
     }
-    // A small reading of the JSON for the terminal, without a JSON library: the fields are flat and known.
+    // Pull the fields out by string search instead of with a JSON library, since the document is flat and its field names are known.
     let field = |name: &str| -> String {
         let needle = format!("\"{name}\":");
         body.find(&needle).map(|i| {
@@ -415,7 +415,7 @@ pub fn history(port: &Port, relation: &str, json: bool) -> Result<String> {
     Ok(out)
 }
 
-/// A helper on the local medium for explain output.
+/// A directory check on the local medium, for the explain output.
 trait DirCheck {
     fn is_dir_path(&self, p: &Path) -> bool;
 }
@@ -430,6 +430,7 @@ impl DirCheck for Local {
 mod tests {
     use super::*;
 
+    /// Turn string literals into owned arguments for parse.
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
     }
