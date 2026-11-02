@@ -1,116 +1,55 @@
 # Replica
 
-Replica is a local file sync service. Under rules you declare, it keeps related files in agreed states across locations on the same machine while showing you what it is doing.
-
-You declare relations in a YAML file. Each relation says which locations hold copies of the same files, in which directions edits, new files, and deletions may travel between them, and how to settle a disagreement. The daemon scans those locations on a schedule, or sooner when the filesystem reports a change, compares what it finds with the state it recorded after the last agreement, decides what each location should hold, then writes, deletes, archives, records, and reports. The design is described in full in [docs/design.md](docs/design.md).
+Replica is a daemon that keeps files in sync between folders on one machine. You declare which folders hold copies of the same files, and in which directions edits, new files, and deletions may travel. The daemon watches the folders, applies changes as they happen, archives anything it overwrites or deletes, and shows what it is doing on a local dashboard.
 
 
-## Concepts
-
-A **relation** is a named declaration relating several **sites**, the roles in the relation, such as `source` and `dest`.
-
-Each site is a **pattern**: an absolute path with variables in braces. `~/Desktop/mylibrary/` is the whole tree below that folder (a trailing slash stands for `{path...}`, one or more path segments). `~/scripts/skills/{name}.md` matches one file per name. `/etc/nginx/conf.d/default.conf` is a single file. A variable may carry a constraint: `{file: *.js}` or `{path...: docs/**/*.md}`, or the constraint goes in the relation's `where` block.
-
-A variable that appears on each site of the relation is an **identity variable**; its binding is the **key** of a file, which is how the daemon pairs files across sites. `~/scripts/skills/{name}.md` and `~/.claude/skills/{name}/SKILL.md` pair `prose.md` with `prose/SKILL.md` through `{name}`. A relation whose sites have no variables has exactly one key, so two literal file paths relate two files whatever their names.
-
-A variable listed under `fanout` may appear on some sites only. At such a site it stands for a directory. On each cycle the daemon makes a **replica** of the site for each directory found at that position. `~/Projects/{project}/docs/style/main_style.md` with `fanout: [project]` gives one replica per project folder. A site may also list several locations, or map names to them; each becomes a replica with a stable identity such as `dest[alpha]`.
-
-For each key at each replica the daemon keeps a **basis**: the file as it stood after the last agreement, or a tombstone where the file was deleted. Comparing the basis with what is on disk gives a **transition**: unchanged, edited, appeared, recreated, disappeared, or unreadable.
-
-The **flow** of a relation is a graph over its sites whose edges carry kinds of change: `edit`, `create`, `delete`. `source <-> dest [edit create]` lets edits and new files travel both ways and restores a file deleted on one side from the other; adding `source -> dest [delete]` lets deletions at source delete at dest. An arrow without brackets carries `edit` and `create`. A **resolver** such as `source mtime dest` or `source > dest` settles keys whose replicas disagree; with no rule, a disagreement waits and is shown on the dashboard.
-
-
-## A cycle
-
-For each relation the daemon expands the sites into replicas and refuses the relation if any replica's root lies inside another's or contains one of the daemon's own files. It walks each replica for files, adds the keys it has records for, and reads one observation per replica for each key, reusing the recorded hash when size and modification time match. A key whose replicas all match their bases is skipped.
-
-Otherwise the daemon decides the key. A changed replica proposes its content, or its absence. A proposal travels along the edges of the flow to the replicas they lead to, with the kind chosen by the target's state: content to a replica with the file along `edit` edges, content to a replica lacking it along `create` edges, absence along `delete` edges. A replica with no incoming proposal and no outgoing proposal of its own takes the content of its settled peers, which is how a downstream edit under a one-way edge reverts and how a deleted file is restored. When several proposals meet at one replica with differing content, the resolver decides or the replica waits.
-
-The daemon applies the decision in stages. It stages the needed content in a content-addressed blob store, where it also archives anything about to be overwritten or deleted. An intent row and marker files then record what is about to happen. Files are written through a temporary sibling and renamed into place, after which the records commit in a single transaction. A failure at any stage leaves the records as they were, so the next cycle plans again. An intent row found at startup means a previous run died mid-plan; it is reported and the key reconciled fresh.
-
-A relation's **gate**, or the global one, holds all writes while planning and reporting continue. The held plan is visible on the dashboard and in `replica plan`.
-
-
-## Configuration
-
-The example in [config.example.yaml](config.example.yaml) shows each feature with comments. In brief:
+## Example
 
 ```yaml
 state: ~/scripts/replica/live
-interval: 1m
-watch: true
-ignore: ["**/.DS_Store"]
 dashboard: { port: 18516 }
-
-vars: { projects: ~/Desktop/Projects }
-
-profiles:
-    _: { log: "${state}/logs/${relation}.log" }
-    two-way: { flow: "source <-> dest [edit create]" }
 
 relations:
     mylibrary:
-        profile: two-way
-        sites: { source: ~/Desktop/mylibrary/, dest: ~/scripts/desktop-library/ }
-        where: { path: "*.js" }
+        sites:
+            source: ~/Desktop/mylibrary/
+            dest: ~/scripts/desktop-library/
+        flow: "source <-> dest [edit create]"
         resolve: "source mtime dest"
 
-    style-guide-all:
+    skills:
         sites:
-            source: ~/scripts/rules/main_style.md
-            dest: "${projects}/{project}/docs/style/main_style.md"
-        fanout: [project]
-        flow: "source -> dest [edit create delete]"
+            source: ~/scripts/skills/{name}.md
+            dest: ~/.claude/skills/{name}/SKILL.md
+        flow: "source -> dest [all]"
 ```
 
-Configuration variables are written `${name}` and expand in paths, patterns, flow statements, commands, and log paths; `${relation}` is the relation's name and `${state}` the state directory. The expansion skips the path variables in braces, which belong to patterns, so a path variable and a configuration variable can share a name. Profiles are bundles of relation fields, deep-merged in order: the profile `_`, then each listed profile, then the relation's own fields. `include` pulls in further files or globs; `each` stamps a relation out once per listed value. An unknown field is an error wherever it appears, with the message pointing at the profile or relation holding it.
+The first relation keeps two folders in sync both ways. Edits and new files travel in either direction, a file deleted on one side is restored from the other, and when both sides change, the newer file wins. The second copies each `skills/NAME.md` to `NAME/SKILL.md` in one direction, deletions included, and reverts any edit made on the receiving side.
 
-A relation may run shell commands on its events under `on` (`changed`, `resolved`, `held`, `conflict`, `error`), with `${key}`, `${path}`, `${replica}`, `${site}`, and `${op}` filled in at run time. It may also rewrite content on an edge under `transform`, where the command receives `${in}` and `${out}`.
+[config.example.yaml](config.example.yaml) shows the rest: variables, profiles, fan-out across project folders, ignore lists, gates, and shell commands that run after a sync or rewrite content on the way. [docs/design.md](docs/design.md) explains how the daemon decides what to do.
 
 
-## Commands
+## Running it
 
 ```sh
 cargo build
-./target/debug/replica check --config config.yaml  # load, expand replicas, report overlaps
-./target/debug/replica explain --config config.yaml  # how each relation resolves: profiles, variables, patterns, replicas, flow
-./target/debug/replica plan --config config.yaml  # what the next cycle would do, without writing
-./target/debug/replica run --config config.yaml  # run cycles at the configured interval
-./target/debug/replica run --config config.yaml --once  # one cycle, then exit (status 1 on errors)
-cargo test  # unit tests and the end-to-end suites
+./target/debug/replica check --config config.yaml
+./target/debug/replica plan --config config.yaml
+./target/debug/replica run --config config.yaml
 ```
 
-With a daemon running, `status`, `sync`, `pause`, `resume`, `restart`, `halt`, `gate open|closed [--relation NAME]`, and `history RELATION` talk to it over the dashboard port, given as `--port N` or read from `--config PATH`. `forget --config PATH RELATION REPLICA` drops the records of one replica, for a location that was replaced rather than moved; halt the daemon first, since `forget` writes to the state database without taking its lock. Only one daemon may run against a state directory. A second one finds the lock file inside it and exits.
+`check` validates the configuration, `plan` shows what the daemon would do without doing it, and `run` starts the daemon. The dashboard is then at `http://localhost:18516`. While the daemon runs, `replica status`, `sync`, `pause`, `resume`, `gate open|closed`, `restart`, and `halt` control it from the command line. `replica --help` lists everything.
 
-The dashboard at `http://localhost:<port>` lists each relation with its replicas, the files and their state at each replica, the plan the next sync applies or the reason a file waits, and the recent activity. Its buttons post to `/sync`, `/pause`, `/resume`, `/gate?to=open|closed[&rel=NAME]`, `/restart`, and `/halt` from the loopback interface alone. `GET /status.json` serves the process state, counters, watch state, and one entry per relation; `GET /history?rel=NAME` lists archived versions with downloads. For launchd setup see [docs/service-mac.md](docs/service-mac.md).
+To run it as a login service, see [docs/service-mac.md](docs/service-mac.md).
 
 
 ## Safety
 
-Before a plan writes anything, the daemon stages the content it needs and archives each file it will overwrite or delete, so nothing is destroyed unarchived; the archive is capped and evicts the oldest versions of the largest relation. Writes go through a temporary sibling and an atomic rename. For the duration of the plan, a marker file named `<file>.replica.tmp` stands beside each file being created or deleted; a marker left behind means a run died partway, with the relation, key, and operation in progress written inside it. SIGTERM, SIGINT, halt, and restart stop the daemon at the boundary between keys, so a write in progress finishes first.
+Before the daemon overwrites or deletes a file, it copies the file into an archive in the state folder, and the dashboard's history page lets you download old versions. Writes go to a temporary file that is renamed into place, so a crash leaves either the old file or the new one. If a folder that used to have files disappears, as when a drive is unmounted, the daemon pauses that relation instead of treating the files as deleted.
 
-When a folder with records is missing, as with an unmounted volume, the daemon marks its relation unavailable and leaves the other locations as they are. A file that appears where the daemon has no record of one conforms to its peers, so copying files by hand to bootstrap a location is safe; a file recreated where the daemon recorded a deletion is treated as an edit. At startup the daemon refuses overlapping roots, as well as any root containing the state directory or a log file.
-
-
-## Layout
-
-- `src/pattern.rs`: patterns, variables, constraints, matching and substitution
-- `src/site.rs`: sites, keys, replicas, discovery of files under a replica
-- `src/observe.rs`: snapshots, observations, bases, transitions
-- `src/flow.rs`: flow statements, kinds, closure, resolver rules
-- `src/decide.rs`: the rules deciding what each replica of a key should hold
-- `src/apply.rs`: the executor: staging, archiving, journaling, writing, committing, transforms
-- `src/engine.rs`: cycles, discovery, reports, gates
-- `src/store.rs`, `src/blobs.rs`: the SQLite state database and the content-addressed blob store
-- `src/medium.rs`: file operations behind a trait, with the local filesystem implementation
-- `src/event.rs`, `src/action.rs`, `src/watch.rs`: events and hooks, shell actions and transforms, filesystem notification
-- `src/config/`: the YAML form, the merge algebra (variables, profiles, includes, each), the loader
-- `src/dashboard/`: the HTTP layer, status JSON, page rendering, the server, with the stylesheet and favicon
-- `src/cli.rs`, `src/main.rs`: subcommands and the daemon loop
-- `tests/`: end-to-end suites over temporary directories
-- `docs/`: [design.md](docs/design.md), [service-mac.md](docs/service-mac.md), [todo.md](docs/todo.md), [design-style.md](docs/design-style.md)
+A closed gate lets the daemon plan and report without writing anything. When trying a new configuration, start with `gate: true`, look at the dashboard, and then open the gate from there or with `replica gate open`.
 
 
-## Coming from the first design
+## Upgrading from 1.x
 
-The configuration form changed entirely: `entries` became `relations`, `labels` became `sites`, `pattern` became `where`, the three `propagate` graphs became one `flow` with kinds in brackets, `scan` and `rename` disappeared into patterns, and placeholders became `${name}`. The state database has a new schema, so the daemon refuses an old one; start a fresh state directory. The first cycle behaves as a first run, aligning identical content and holding differing content for a decision, so run it under a closed gate (`gate: true` or `--gate`) and read the dashboard before opening the gate. [config.redesign.yaml](config.redesign.yaml) is the live configuration translated to the new form, against a fresh state directory and a second dashboard port, so both daemons can run side by side while you compare.
+The configuration format has changed, and the daemon will not open a 1.x state database. Rewrite the configuration with config.example.yaml as a guide, point `state` at a new folder, and start under a closed gate. The first cycle then shows which files already match across sites, which differ, and what the daemon would do about each. [config.redesign.yaml](config.redesign.yaml) is the current live configuration in the new format, with its own state folder and dashboard port, so the old and new versions can run side by side.
