@@ -1,42 +1,24 @@
 # To do
 
-Pending design decisions and operational mechanisms for the sync daemon.
+Open work on the second design. The design itself is in [design.md](design.md).
+
+## Decisions left open
+
+- Whether `changed` actions should also fire for plans a gate holds, so a notification can announce work waiting for the gate.
+- Whether to add a delete-ratio guard: a cycle planning to delete more than a configured fraction of a relation's keys holds the relation until an operator opens the gate. The missing-root guard covers an unmounted volume; the ratio guard would cover a mounted volume emptied by mistake.
+- Whether a proposer whose proposal was left unresolved at some target should keep its basis frozen until the conflict clears. At present its basis advances, and the standing conflict is kept alive by the disagreeing settled peers, which matches the first design.
 
 ## Mechanisms
 
-- Dispatch filesystem notifications (FSEvents on macOS, inotify on Linux) into the poll loop to evaluate changes before scheduled intervals:
-    - The daemon scans directories directly to determine authoritative state.
-    - Incoming notification events trigger evaluation passes early without relying on event delivery guarantees.
-- Support regex parameter constraints in `path:` templates, such as `{date:\d+}` for dated log files.
-- Conflict backup directory and three-way merge resolution:
-    - Write conflicting variants to `dir/<ident>.<label>.bak` before resolving divergences.
-    - Specify retention limits and naming schemes for backup files.
-    - Store baseline file contents per relation alongside recorded hashes to supply merge bases during three-way merges.
-- Prune database records for identifiers missing across extended sync windows, expanding cleanup beyond records with all replicas absent.
-- Prune record and unresolved rows for refs removed from the configuration. A stale unresolved row keeps its identifier under full evaluation every cycle.
-- Trigger full re-resolution across managed records upon modifying relation policies. Evaluation routines currently skip matching file hashes, bypassing updated policy rules on established records.
-
-## Safety
-
-- Abort batch deletions when the proportion of removed files exceeds a configured limit:
-    - The engine halts propagation when an entire root directory disappears, while deleting most files within an intact root still propagates removals along delete edges.
-    - Define a deletion ratio threshold with per-relation overrides.
-- Distinguish initial replica seeding from ongoing discovery along create edges, defining explicit actions for files encountered during initial scans: ignore, seed, or replicate.
-- Include extended diagnostic metadata in conflict marker files, passing the log path, database path, donor hash, and applied policy through the engine apply pipeline.
-- Health indicators and failure alerts:
-    - Write a `DANGER.README` alert file beside the state database upon detecting state inconsistency.
-    - Evaluate optional per-relation heartbeat files for monitoring sync activity, weighing operational visibility against the noise of persistent marker files.
-
-## Configuration
-
-- Replace the endpoint notation: `scan` with `template`, `hole`, and `dir`, plus `root` with `rename`. Find a form as direct as the `propagate` statements.
+- Enumerate a fan-out variable from an explicit list of values as well as from the directory, so a listed folder that is missing shows up as a replica in the folder-missing state instead of vanishing.
+- Read presence from the directory listing rather than from a stat per key, which makes a rename differing only in case on a case-insensitive volume read as a delete plus a create instead of two present files on one inode.
+- Prune records and unresolved marks of replica identities absent from both the configuration and the enumeration for a long time.
+- Store the previous content hash in a tombstone, so a three-way merge command has a base to work from.
+- A merge resolver: `a merge b` running a configured three-way merge command over the two contents and the tombstone's or the basis's content.
+- Give a fan-out variable a constraint by default for `.git`, `node_modules`, and other folders nobody wants as a replica, or at least document the `[a-z]*` idiom from the example.
 
 ## Interface
 
-- Menubar companion:
-    - Poll `/status.json` and post commands to `/pause`, `/resume`, and `/restart` via a SwiftBar plugin or a dedicated Swift application, with shortcuts to reveal configuration files and launch dashboards.
-    - Run the status item in an external process, avoiding main-thread GUI event loop constraints inside the sync daemon.
-- Windows port:
-    - Normalize path separators to forward slashes when converting paths to strings during template matching.
-    - Manage daemon execution through Task Scheduler or the `windows-service` crate, matching the architecture in `docs/service-mac.md`.
-    - Isolate system tray integration into a companion process to avoid coupling GUI event loops with daemon execution.
+- Richer `replica status`: the awaiting and held keys per relation, from the report rather than from the counters.
+- A menubar companion polling `/status.json` and posting to the control endpoints, in its own process.
+- A Windows port: forward slashes in pattern text, Task Scheduler or the `windows-service` crate for the service, a companion process for the tray.

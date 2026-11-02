@@ -9,7 +9,7 @@ Build the release binary, create the log directory (launchd does not create the 
 ```sh
 cargo build --release
 mkdir -p ~/scripts/replica/live/logs
-./target/release/replica --config config.yaml --check
+./target/release/replica check --config config.yaml
 ```
 
 Populate `~/Library/LaunchAgents/com.mariven.replica.plist`, adjusting paths to match your user account:
@@ -24,6 +24,7 @@ Populate `~/Library/LaunchAgents/com.mariven.replica.plist`, adjusting paths to 
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/scripts/replica/target/release/replica</string>
+        <string>run</string>
         <string>--config</string>
         <string>/Users/YOU/scripts/replica/config.yaml</string>
     </array>
@@ -84,7 +85,7 @@ launchctl print gui/$UID/com.mariven.replica  # inspect service registration and
 
 ## Maintain
 
-To update configuration settings, edit `config.yaml`, run `replica --config config.yaml --check` to catch typos and overlapping roots, and send `POST /restart`. Replica loads configuration values during startup, requiring a restart to apply subsequent edits. A restart request first loads the config itself and refuses to exit if the file does not load, so a typo cannot crash-loop the agent.
+To update configuration settings, edit `config.yaml`, run `replica check --config config.yaml` to catch typos and overlapping roots, read `replica explain --config config.yaml` to see how it resolves, and send `POST /restart` (or `replica restart --config config.yaml`). Replica loads configuration values during startup, requiring a restart to apply subsequent edits. A restart request first loads the config itself and refuses to exit if the file does not load, so a typo cannot crash-loop the agent.
 
 To run updated code, compile with `cargo build --release` and send `POST /restart`. The LaunchAgent executes the newly compiled binary directly from `target/release`.
 
@@ -97,11 +98,11 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.mariven.replica.plist
 
 Monitor service logs in `live/logs/`. Synchronization events and errors stream sequentially to `daemon.err`, each line stamped with the local time. Standard output routes to `daemon.log`. Paths configured with a `log:` directive write their events into their dedicated files as well. A condition that persists across cycles, such as a held plan, an open conflict, or a failing operation, is logged when it appears or changes, not on every cycle.
 
-A root that contains the state database, the archive directory, or a log file is refused at startup and by `--check`, since the daemon would otherwise sync its own files. Roots that merely nest inside each other are reported on the dashboard and skipped each cycle, since a scan can produce them at any time.
+A root that contains the state directory or a log file is refused at startup and by `check`, since the daemon would otherwise sync its own files. Roots that merely nest inside each other are reported on the dashboard and skipped each cycle, since a scan can produce them at any time.
 
 Before reorganizing files, send `POST /pause` to hold synchronization passes. Verify planned changes in the dashboard, then send `POST /resume` to process the updates.
 
-Halt the service before running `--once` against the production database. A second instance refuses to start while the first holds the lock file beside the database.
+Halt the service before running `run --once` against the production state directory. A second instance refuses to start while the first holds the lock file inside it.
 
 ## Remove
 
