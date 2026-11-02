@@ -1,8 +1,8 @@
 //! Path patterns: absolute paths with variables in braces, such as `~/.claude/skills/{name}/SKILL.md` or `~/Projects/{project}/docs/{path...: **/*.md}`.
 //!
-//! The parser splits a pattern into segments once. To match a path, the engine reads a value for each variable out of the path and checks it against the variable's constraints; to substitute, it writes the values of a binding back into the pattern and gets a path.
-//! The round trip is exact: when a path matches, substituting the resulting binding yields that same path. This is guaranteed because a pattern holds at most one multi-segment variable, a segment holds at most one variable, and the constraints are checked in both directions.
-//! From the parsed form the engine also derives the directory where the walk starts, how deep the walk goes, the footprint for overlap checks, and the tail of a matched path for the ignore globs.
+//! A pattern is split into segments when it is parsed. To match a path, each variable's value is read out of the path and checked against its constraints. To substitute a binding, the values are written back into the pattern to give a path.
+//! When a path matches, substituting its binding gives back the same path. This works because a pattern has at most one multi-segment variable, each segment has at most one variable, and substitution checks the same constraints as matching.
+//! The parsed form also gives the directory where the walk starts, how deep the walk goes, the footprint used for overlap checks, and the tail of a matched path for the ignore globs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
 
-/// Bound variable values, by variable name.
+/// Variable values keyed by variable name.
 pub type Binding = BTreeMap<String, String>;
 
 /// A constraint on the value of a variable: either a glob, where `*` stays within a segment and `**` crosses segments, or an anchored regular expression.
@@ -20,12 +20,12 @@ pub type Binding = BTreeMap<String, String>;
 pub enum Constraint {
     Glob { text: String, matcher: GlobMatcher },
     Regex { text: String, regex: Regex },
-    /// A constraint written with a leading `!`. It accepts a value exactly when the inner constraint rejects it.
+    /// A constraint written with a leading `!`. It accepts the values the inner constraint rejects.
     Not { text: String, inner: Box<Constraint> },
 }
 
 impl Constraint {
-    /// Parse constraint text: `~re~` is a regular expression, anything else a glob.
+    /// Parse constraint text. `~re~` is a regular expression, a leading `!` negates the rest, and anything else is a glob.
     pub fn parse(text: &str) -> Result<Constraint> {
         let text = text.trim();
         if text.is_empty() {
@@ -42,7 +42,7 @@ impl Constraint {
         Ok(Constraint::Glob { text: text.to_owned(), matcher })
     }
 
-    /// Check a bound value against the constraint.
+    /// True if the value satisfies the constraint.
     pub fn admits(&self, value: &str) -> bool {
         match self {
             Constraint::Glob { matcher, .. } => matcher.is_match(value),
@@ -58,7 +58,7 @@ impl Constraint {
         }
     }
 
-    /// The number of path segments spanned by a glob without `**` or a character class, so the walk can stop at that depth. None for other constraints, since they leave the depth unbounded.
+    /// The number of segments a glob spans, so the walk can stop at that depth. None for a glob with `**` or a character class, and for the other kinds of constraint, since the walk then has no fixed depth to stop at.
     fn segment_count(&self) -> Option<usize> {
         match self {
             Constraint::Glob { text, .. } if !text.contains("**") && !text.contains('[') => Some(text.matches('/').count() + 1),
@@ -80,12 +80,12 @@ pub struct Var {
     pub name: String,
     /// True for `{name...}`, which binds one or more segments.
     pub multi: bool,
-    /// Constraints from the pattern text and from a `where` block, all of which the value must satisfy.
+    /// Constraints from the pattern text and from a `where` block. A value must satisfy all of them.
     pub constraints: Vec<Constraint>,
 }
 
 impl Var {
-    /// Check a value against each constraint of the variable.
+    /// True if the value satisfies all of the variable's constraints.
     fn admits(&self, value: &str) -> bool {
         self.constraints.iter().all(|c| c.admits(value))
     }
@@ -129,14 +129,14 @@ impl fmt::Display for Pattern {
     }
 }
 
-/// Check that a variable name is an identifier: letters, digits, and underscores, with a letter or underscore first.
+/// True if the name is an identifier: letters, digits, and underscores, starting with a letter or underscore.
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 impl Pattern {
-    /// Parse pattern text. A leading `~` is expanded to the home directory; the result must be absolute. A trailing `/` appends `{path...}`.
+    /// Parse pattern text. A leading `~` expands to the home directory, after which the path must be absolute. A trailing `/` is short for `/{path...}`.
     pub fn parse(text: &str) -> Result<Pattern> {
         let expanded = shellexpand::tilde(text.trim()).into_owned();
         if !expanded.starts_with('/') {
@@ -198,7 +198,7 @@ impl Pattern {
         Ok(Pattern { text: body, segments, vars, regex, root })
     }
 
-    /// The pattern text after `~` expansion, with a trailing `/` already rewritten as `/{path...}`.
+    /// The pattern text with `~` expanded and a trailing `/` written out as `/{path...}`.
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -213,24 +213,24 @@ impl Pattern {
         self.vars.iter().map(|v| v.name.as_str()).collect()
     }
 
-    /// Add a constraint to a variable, as a `where` block does. Fails when the pattern has no such variable.
+    /// Add a constraint to a variable, as a `where` block does. Fails if the pattern has no variable by that name.
     pub fn constrain(&mut self, name: &str, constraint: Constraint) -> Result<()> {
         let var = self.vars.iter_mut().find(|v| v.name == name).with_context(|| format!("pattern {} has no variable {{{name}}}", self.text))?;
         var.constraints.push(constraint);
         Ok(())
     }
 
-    /// The directory where the walk for matching files begins. It is made of the literal segments before the first variable; a pattern without variables uses its parent directory.
+    /// The directory where the walk for matching files starts: the path made of the literal segments before the first variable, or the parent directory if the pattern has no variables.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The part of the filesystem covered by the pattern, for overlap checks: the root, or the file itself when the pattern has no variables.
+    /// The part of the filesystem the pattern covers, for overlap checks. It is the root, or the file itself if the pattern has no variables.
     pub fn footprint(&self) -> PathBuf {
         if self.vars.is_empty() { PathBuf::from(&self.text) } else { self.root.clone() }
     }
 
-    /// The depth of a matching file below the root, counted in segments. None when a multi-segment variable leaves the depth unbounded.
+    /// How many segments a matching file lies below the root, counting its own, or None if a multi-segment variable allows any depth.
     pub fn depth(&self) -> Option<usize> {
         let fixed = self.segments.len() - self.root_segments();
         match self.vars.iter().find(|v| v.multi) {
@@ -242,12 +242,12 @@ impl Pattern {
         }
     }
 
-    /// Number of leading literal segments, which is the root's segment count below `/`.
+    /// The number of segments in the root below `/`.
     fn root_segments(&self) -> usize {
         if self.vars.is_empty() { self.segments.len() - 1 } else { self.segments.iter().take_while(|s| s.var.is_none()).count() }
     }
 
-    /// Match an absolute path, binding each variable and checking its constraints. None when the path lies outside the pattern.
+    /// The binding for an absolute path, or None if the path does not match the pattern or a value fails its constraints.
     pub fn matches(&self, path: &Path) -> Option<Binding> {
         let text = path.to_string_lossy();
         let caps = self.regex.captures(&text)?;
@@ -262,16 +262,16 @@ impl Pattern {
         Some(binding)
     }
 
-    /// Fill each variable from the binding, checking its constraints, to produce the path.
+    /// The path for a binding. Fails if the binding lacks a variable or a value does not fit its variable.
     pub fn substitute(&self, binding: &Binding) -> Result<PathBuf> {
         Ok(PathBuf::from(self.bound_text(binding, true)?))
     }
 
-    /// Bind some variables, yielding a pattern over the rest. The remaining text is parsed again so the root and depth follow the bound prefix.
+    /// Fill in some of the variables and return a pattern over the rest. The new text is parsed again, so when the filled-in variables come first, the root moves down past them.
     pub fn bind(&self, binding: &Binding) -> Result<Pattern> {
         let text = self.bound_text(binding, false)?;
         let mut out = Pattern::parse(&text)?;
-        // A where block adds constraints to the variables without changing the text, so the reparse loses them; copy them over.
+        // Constraints from a where block are missing from the text, so they are copied over from the original variables.
         for var in &self.vars {
             if let Some(target) = out.vars.iter_mut().find(|v| v.name == var.name) {
                 target.constraints = var.constraints.clone();
@@ -280,7 +280,7 @@ impl Pattern {
         Ok(out)
     }
 
-    /// Render the pattern, replacing each bound variable with its value. An unbound variable is written back as it appeared, or is an error when `complete` is set.
+    /// The pattern text with each bound variable replaced by its value. If `complete` is set, an unbound variable is an error. Otherwise it is written back in braces with its first constraint.
     fn bound_text(&self, binding: &Binding, complete: bool) -> Result<String> {
         let mut out = String::new();
         for seg in &self.segments {
@@ -315,20 +315,20 @@ impl Pattern {
         Ok(out)
     }
 
-    /// The part of `path` beneath the root, joined with `/`. None when the path lies elsewhere.
+    /// The part of `path` below the root, or None if the path is not below it.
     pub fn tail(&self, path: &Path) -> Option<String> {
         let rel = path.strip_prefix(&self.root).ok()?;
         let text = rel.to_string_lossy().into_owned();
         if text.is_empty() { None } else { Some(text) }
     }
 
-    /// Each variable paired with the depth of its segment below the root, in pattern order. The fan-out enumeration walks these.
+    /// Each variable with the depth of its segment below the root, in pattern order. The fan-out walk lists directories at these depths.
     pub fn var_segments(&self) -> Vec<(usize, &Var)> {
         let root = self.root_segments();
         self.segments.iter().enumerate().filter_map(|(i, s)| s.var.map(|v| (i - root, &self.vars[v]))).collect()
     }
 
-    /// Match a directory entry name against the segment at `depth` below the root. None when the name does not fit; Some(None) when it equals a literal segment; Some(Some((variable, value))) when the segment holds a variable and the name binds it.
+    /// Match a directory entry name against the segment at `depth` below the root. The result is None if the name does not fit, Some(None) if the segment is literal and the name equals it, and Some(Some((variable, value))) if the segment holds a variable and the name gives it a value.
     pub fn match_segment(&self, depth: usize, name: &str) -> Option<Option<(String, String)>> {
         let seg = self.segments.get(self.root_segments() + depth)?;
         match seg.var {
@@ -341,13 +341,13 @@ impl Pattern {
         }
     }
 
-    /// The literal text of the segment at `depth` below the root, or None when that segment holds a variable or lies past the end.
+    /// The literal text of the segment at `depth` below the root, or None if that segment holds a variable or is past the end.
     pub fn segment_literal(&self, depth: usize) -> Option<&str> {
         let seg = self.segments.get(self.root_segments() + depth)?;
         seg.var.is_none().then_some(seg.before.as_str())
     }
 
-    /// Total segment count below the root, which bounds fan-out enumeration.
+    /// The number of segments below the root, which limits how deep the fan-out walk goes.
     pub fn segments_below_root(&self) -> usize {
         self.segments.len() - self.root_segments()
     }
@@ -391,7 +391,7 @@ fn matching_close(text: &str, open: usize) -> Option<usize> {
     None
 }
 
-/// Compile the matching regular expression. Literal text is escaped; a single variable matches one segment and a multi variable matches one or more.
+/// Compile the regular expression used for matching. A single-segment variable captures one segment, a multi-segment variable captures one or more, and the literal text around them is escaped.
 fn build_regex(segments: &[Segment], vars: &[Var]) -> Regex {
     let mut rx = String::from("^");
     for seg in segments {
@@ -406,7 +406,7 @@ fn build_regex(segments: &[Segment], vars: &[Var]) -> Regex {
     Regex::new(&rx).expect("escaped literals and fixed groups form a valid regex")
 }
 
-/// The literal directory prefix: segments before the first variable, or the parent directory when there is no variable.
+/// The literal directory prefix: the segments before the first variable, or the parent directory if there is no variable.
 fn root_of(segments: &[Segment]) -> PathBuf {
     let literal: Vec<&str> = segments.iter().take_while(|s| s.var.is_none()).map(|s| s.before.as_str()).collect();
     let take = if literal.len() == segments.len() { literal.len() - 1 } else { literal.len() };
@@ -417,7 +417,7 @@ fn root_of(segments: &[Segment]) -> PathBuf {
     root
 }
 
-/// Render a binding as `name=value, name=value` in name order, or the lone value when it has one entry.
+/// A binding as text: the value alone if there is one variable, otherwise `name=value` pairs in name order.
 pub fn describe_binding(binding: &Binding) -> String {
     match binding.len() {
         1 => binding.values().next().cloned().unwrap_or_default(),
@@ -466,7 +466,7 @@ mod tests {
         assert!(p.matches(Path::new("/u/lib/app.js")).is_some());
         assert!(p.matches(Path::new("/u/lib/sub/app.js")).is_none(), "a single star stays within one segment");
         assert!(p.matches(Path::new("/u/lib/notes.txt")).is_none());
-        // A where-block constraint stacks on the inline one.
+        // A where-block constraint applies on top of the inline one.
         p.constrain("path", Constraint::parse("a*").unwrap()).unwrap();
         assert!(p.matches(Path::new("/u/lib/app.js")).is_some());
         assert!(p.matches(Path::new("/u/lib/util.js")).is_none());
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(bound.text(), "/u/Projects/alpha/docs/style/{path...}");
         assert_eq!(bound.root(), Path::new("/u/Projects/alpha/docs/style"));
         assert_eq!(bound.var_names(), BTreeSet::from(["path"]));
-        // Bound text keeps constraints of the remaining variables.
+        // The bound pattern keeps the constraints of the variables still unbound.
         let c = Pattern::parse("/u/Projects/{project: [a-z]*}/docs/{path...: *.md}").unwrap();
         let bound = c.bind(&bind(&[("project", "alpha")])).unwrap();
         assert_eq!(bound.text(), "/u/Projects/alpha/docs/{path...: *.md}");

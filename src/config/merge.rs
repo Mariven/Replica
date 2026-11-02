@@ -1,4 +1,4 @@
-//! Compose the configuration. This module expands `${name}` variables, deep-merges profiles into relation bodies, resolves and merges included files, and stamps out a relation per combination of `each` values.
+//! Helpers that combine the pieces of a configuration. They expand `${name}` variables, merge profiles into relation bodies, read and merge included files, and make a copy of a relation for each combination of its `each` values.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -6,17 +6,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_norway::{Mapping, Value};
 
-/// Expand the `${name}` references in a string against a scope. A variable's value may hold references of its own, which are expanded in turn. A cycle or an unknown name is an error.
+/// Replace each `${name}` in a string with its value from `scope`. A value may contain references of its own, and these are expanded too. An unknown name or a cycle is an error.
 pub fn expand_vars(text: &str, scope: &BTreeMap<String, String>) -> Result<String> {
     expand_with_stack(text, scope, false, &mut Vec::new())
 }
 
-/// Expand the known `${name}` references and leave unknown ones as written. Command strings are expanded this way, since their remaining placeholders are filled in when the command runs.
+/// Like expand_vars, but an unknown name is left as written. Commands are expanded this way because their other placeholders are filled in when the command runs.
 pub fn expand_vars_lenient(text: &str, scope: &BTreeMap<String, String>) -> Result<String> {
     expand_with_stack(text, scope, true, &mut Vec::new())
 }
 
-/// The recursive worker behind expand_vars. `stack` lists the variables currently being expanded, so meeting one of them again means a cycle.
+/// The recursive part of expand_vars and expand_vars_lenient. `stack` holds the names being expanded, so finding one of them again means a cycle.
 fn expand_with_stack(text: &str, scope: &BTreeMap<String, String>, lenient: bool, stack: &mut Vec<String>) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -46,7 +46,7 @@ fn expand_with_stack(text: &str, scope: &BTreeMap<String, String>, lenient: bool
     Ok(out)
 }
 
-/// The relation fields holding commands. Unknown placeholders under these are left in place for run time.
+/// The relation fields that hold commands. Unknown placeholders in them are left in place until the command runs.
 const COMMAND_FIELDS: [&str; 2] = ["on", "transform"];
 
 /// Expand variables in each string of a YAML value, including mapping keys. Strings under `on` and `transform` keep unknown placeholders.
@@ -54,7 +54,7 @@ pub fn expand_value(v: &Value, scope: &BTreeMap<String, String>) -> Result<Value
     expand_inner(v, scope, false)
 }
 
-/// The recursive worker behind expand_value.
+/// The recursive part of expand_value. `lenient` is true inside `on` and `transform`.
 fn expand_inner(v: &Value, scope: &BTreeMap<String, String>, lenient: bool) -> Result<Value> {
     let expand = |s: &str| if lenient { expand_vars_lenient(s, scope) } else { expand_vars(s, scope) };
     Ok(match v {
@@ -77,7 +77,7 @@ fn expand_inner(v: &Value, scope: &BTreeMap<String, String>, lenient: bool) -> R
     })
 }
 
-/// Deep-merge `over` into `base`. When both are mappings, each key of `over` is added to `base` or merged into the matching key there. Any other kind of value in `over` replaces the value in `base` outright.
+/// Deep-merge `over` into `base`. If both are mappings, each key of `over` is merged into the same key of `base`, or added if `base` lacks it. Otherwise `over` replaces `base`, so lists are replaced whole.
 pub fn deep_merge(base: &mut Value, over: &Value) {
     match (base, over) {
         (Value::Mapping(b), Value::Mapping(o)) => {
@@ -92,8 +92,8 @@ pub fn deep_merge(base: &mut Value, over: &Value) {
     }
 }
 
-/// Assemble a relation body from its profiles: the profile `_` when present, then each listed profile in order, then the body itself.
-/// A profile may list profiles of its own, which are merged before it. The chain is refused when it comes back around to a profile already on it.
+/// Merge a relation body over its profiles. The layers are the profile `_` if it exists, then each listed profile in order, then the body itself, and later layers win.
+/// A profile may list profiles of its own, and these are merged before it. A profile that lists itself, directly or through other profiles, is an error.
 pub fn assemble(body: &Mapping, profiles: &Mapping) -> Result<Mapping> {
     let mut out = Value::Mapping(Mapping::new());
     if let Some(defaults) = profiles.get("_") {
@@ -112,7 +112,7 @@ pub fn assemble(body: &Mapping, profiles: &Mapping) -> Result<Mapping> {
     }
 }
 
-/// Merge a profile into the body under assembly. Any profiles listed inside it are merged first.
+/// Merge a profile into `out`, after the profiles it lists. `chain` holds the profiles being merged, so a repeat means a cycle.
 fn merge_profile(name: &str, profile: &Value, profiles: &Mapping, out: &mut Value, chain: &mut Vec<String>) -> Result<()> {
     let Value::Mapping(map) = profile else { bail!("profile {name:?} must be a mapping of relation fields") };
     for sub in listed_profiles(map)? {
@@ -130,7 +130,7 @@ fn merge_profile(name: &str, profile: &Value, profiles: &Mapping, out: &mut Valu
     Ok(())
 }
 
-/// Read the `profile` field of a body, which may be a string or a list of strings.
+/// The names in a body's `profile` field, which may be a string or a list of strings.
 fn listed_profiles(body: &Mapping) -> Result<Vec<String>> {
     Ok(match body.get("profile") {
         None | Some(Value::Null) => Vec::new(),
@@ -140,7 +140,7 @@ fn listed_profiles(body: &Mapping) -> Result<Vec<String>> {
     })
 }
 
-/// Stamp a relation out once per combination of its `each` values. A copy's name is the relation name with its values appended, as in `rules-alpha-x`. The copy also gets those values as variables.
+/// Make a copy of a relation for each combination of its `each` values. Each copy is named after the relation with its values appended, as in `rules-alpha-x`, and gets those values as variables.
 pub fn stamp(name: &str, body: &Mapping) -> Result<Vec<(String, Mapping, BTreeMap<String, String>)>> {
     let each: BTreeMap<String, Vec<String>> = match body.get("each") {
         None | Some(Value::Null) => BTreeMap::new(),
@@ -164,7 +164,7 @@ pub fn stamp(name: &str, body: &Mapping) -> Result<Vec<(String, Mapping, BTreeMa
     }).collect())
 }
 
-/// Resolve an include entry to a list of files. The entry is either a path or a glob over the entries of a single directory. A relative entry is resolved against the including file's directory.
+/// The files an include entry refers to. An entry is a path, and its file name may contain wildcards. A relative entry is resolved against the folder of the including file.
 pub fn included_files(entry: &str, base: &Path) -> Result<Vec<PathBuf>> {
     let expanded = shellexpand::tilde(entry).into_owned();
     let path = if Path::new(&expanded).is_absolute() { PathBuf::from(&expanded) } else { base.join(&expanded) };
@@ -190,7 +190,7 @@ pub fn included_files(entry: &str, base: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Merge the vars, profiles, relations, and ignore list of an included file into the main file. When both files define the same name, the merge fails.
+/// Merge the vars, profiles, relations, and ignore list of an included file into the main file. A name defined in both files is an error.
 pub fn merge_included(main: &mut super::text::FileText, other: super::text::FileText, main_path: &Path, other_path: &Path) -> Result<()> {
     if other.state.is_some() || other.interval.is_some() || other.dashboard.is_some() || !other.include.is_empty() {
         bail!("included file {} may only set vars, profiles, relations, and ignore", other_path.display());
@@ -217,7 +217,7 @@ pub fn merge_included(main: &mut super::text::FileText, other: super::text::File
     Ok(())
 }
 
-/// The keys of a body that fall outside `allowed`. The profile check runs this on each profile before any relation merges it in.
+/// The keys of `body` that are not in `allowed`. Profiles are checked with this before any relation merges them in.
 pub fn unknown_fields(body: &Mapping, allowed: &[&str]) -> BTreeSet<String> {
     body.keys().filter_map(|k| k.as_str()).filter(|k| !allowed.contains(k)).map(str::to_owned).collect()
 }

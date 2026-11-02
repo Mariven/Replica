@@ -1,5 +1,5 @@
-//! Run the scenarios of the first design against the redesigned engine, end to end, over temporary directories.
-//! Each test loads a relation from YAML in the new form, builds an engine over a fresh state database, then drives cycles and checks the files, the records, the report, the events.
+//! End-to-end tests of the core sync scenarios, run over temporary folders. The tests named case_1 to case_5 cover the use cases the project was built for: two folders both ways, a renamed file, a mirror into fixed folders, discovered fan-out, and a path rewrite.
+//! Each test loads relations from YAML and builds an engine over a fresh state database. It then runs cycles and checks the files, records, report, and events.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ fn load(yaml: &str) -> anyhow::Result<Loaded> {
     config::load(yaml, Path::new("/cfg/config.yaml"))
 }
 
-/// The error text from loading a configuration; panics when the loader accepts it.
+/// The error text from loading a configuration. Panics if the loader accepts it.
 fn load_error(yaml: &str) -> String {
     match load(yaml) {
         Err(e) => format!("{e:#}"),
@@ -34,10 +34,10 @@ fn engine(tmp: &TempDir, relations_yaml: &str) -> Engine {
     engine_with_events(tmp, relations_yaml).0
 }
 
-/// The events recorded from an engine, one `kind relation key: text` line each.
+/// Events recorded from an engine, each as a `kind relation key: text` line.
 type Events = Arc<Mutex<Vec<String>>>;
 
-/// Build an engine over the relations, recording each emitted event through a hook.
+/// Build an engine over the relations, with a hook that records each event it emits.
 fn engine_with_events(tmp: &TempDir, relations_yaml: &str) -> (Engine, Events) {
     let loaded = load(&format!("relations:\n{relations_yaml}")).unwrap();
     let seen: Events = Arc::default();
@@ -48,13 +48,13 @@ fn engine_with_events(tmp: &TempDir, relations_yaml: &str) -> (Engine, Events) {
     (build(tmp, &tmp.path().join("state.db"), loaded, vec![hook]), seen)
 }
 
-/// Assemble an engine from loaded relations: a store at `db`, a blob store in the temporary directory, the local filesystem, the temporary directory as the working directory.
+/// Build an engine on the local filesystem from loaded relations, with its store at `db`, its blob store inside the temporary directory, and the temporary directory as its working directory.
 fn build(tmp: &TempDir, db: &Path, loaded: Loaded, hooks: Vec<Hook>) -> Engine {
     let blobs = Blobs { dir: tmp.path().join("blobs"), cap: 1 << 20 };
     Engine::new(Store::open(db).unwrap(), blobs, Box::new(Local), loaded.relations, hooks, tmp.path().to_path_buf())
 }
 
-/// YAML for a relation with `source` over folder `a` and `dest` over folder `b` under the given flow. Callers append further fields at the same indentation.
+/// YAML for a relation with folder `a` as its `source` site, folder `b` as its `dest` site, and the given flow. Callers can append more fields at the same indentation.
 fn pair(name: &str, a: &Path, b: &Path, flow: &str) -> String {
     format!("    {name}:\n      sites: {{ source: \"{}/\", dest: \"{}/\" }}\n      flow: \"{flow}\"\n", a.display(), b.display())
 }
@@ -65,12 +65,12 @@ fn write(path: impl AsRef<Path>, content: &str) {
     fs::write(path, content).unwrap();
 }
 
-/// Read a file as text, None when it is absent.
+/// The text of a file, or None if it is missing.
 fn read(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-/// Set the modification time of a file to a count of seconds past the Unix epoch, so an ordering between files does not depend on how fast the test runs.
+/// Set a file's modification time to `secs` seconds after the Unix epoch, so tests can order files by mtime without depending on how fast they run.
 fn set_mtime(path: impl AsRef<Path>, secs: u64) {
     let f = fs::File::options().write(true).open(path).unwrap();
     f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
@@ -81,7 +81,7 @@ fn count(events: &Events, prefix: &str) -> usize {
     events.lock().unwrap().iter().filter(|l| l.starts_with(prefix)).count()
 }
 
-/// The display names of a relation's replicas as the report lists them.
+/// The display names of a relation's replicas, in the order the report lists them.
 fn replica_names(eng: &Engine, relation: usize) -> Vec<String> {
     eng.report().relations[relation].replicas.iter().map(|r| r.name.clone()).collect()
 }
@@ -101,7 +101,7 @@ fn case_1_two_folders_bidirectional() {
         a.display(), b.display()
     ));
 
-    // The first cycle records both folders; edits on either side then travel to the other.
+    // The first cycle records both folders. After that, an edit on either side travels to the other.
     eng.cycle(None).unwrap();
     write(a.join("app.js"), "console.log(2)");
     eng.cycle(None).unwrap();
@@ -111,7 +111,7 @@ fn case_1_two_folders_bidirectional() {
     eng.cycle(None).unwrap();
     assert_eq!(read(a.join("util.js")).unwrap(), "util v2");
 
-    // The constraint admits JavaScript alone, so the text file stays out of the destination.
+    // The constraint matches only .js files, so notes.txt is not copied.
     assert_eq!(read(b.join("notes.txt")), None);
 }
 
@@ -121,19 +121,19 @@ fn case_2_rename_via_two_literal_files() {
     let (conf_dir, desk) = (tmp.path().join("nginx/conf.d"), tmp.path().join("Desktop"));
     write(conf_dir.join("default.conf"), "server {}");
 
-    // Two patterns without variables relate two files under different names.
+    // Each site is a single file, so two files with different names are related.
     let eng = engine(&tmp, &format!(
         "    nginx-default:\n      sites: {{ source: \"{}/default.conf\", dest: \"{}/nginx-conf.txt\" }}\n      flow: \"source <-> dest [edit]\"\n",
         conf_dir.display(), desk.display()
     ));
 
-    // The first cycle records the source file; an empty destination file appearing afterwards conforms to it.
+    // The first cycle records the source file. An empty file that then appears at dest is new, so it takes the source content.
     eng.cycle(None).unwrap();
     write(desk.join("nginx-conf.txt"), "");
     eng.cycle(None).unwrap();
     assert_eq!(read(desk.join("nginx-conf.txt")).unwrap(), "server {}");
 
-    // An edit of the renamed file travels back into the configuration directory.
+    // An edit to the Desktop copy travels back to default.conf.
     write(desk.join("nginx-conf.txt"), "server { listen 80; }");
     eng.cycle(None).unwrap();
     assert_eq!(read(conf_dir.join("default.conf")).unwrap(), "server { listen 80; }");
@@ -149,7 +149,7 @@ fn case_3_explicit_fan_out_mirror() {
         write(p.join("main_style.md"), "v1");
     }
 
-    // The destination site lists its locations, so each becomes a replica labeled by the pattern text as written.
+    // The dest site lists several patterns, and each becomes a replica labeled with its pattern text.
     let listed: Vec<String> = projects.iter().map(|p| format!("          - \"{}/main_style.md\"", p.display())).collect();
     let eng = engine(&tmp, &format!(
         "    style-guide:\n      sites:\n        source: \"{}/main_style.md\"\n        dest:\n{}\n      flow: \"source -> dest [edit]\"\n",
@@ -163,18 +163,18 @@ fn case_3_explicit_fan_out_mirror() {
         assert_eq!(read(p.join("main_style.md")).unwrap(), "v2");
     }
 
-    // An edit at a destination has no edge to leave by, so the one-way edge reverts it to the source content.
+    // An edit at a dest replica has no edge to leave by, so it is reverted to the source content.
     write(projects[1].join("main_style.md"), "local heresy");
     eng.cycle(None).unwrap();
     assert_eq!(read(projects[1].join("main_style.md")).unwrap(), "v2");
 
-    // Replicas sharing a site are named by their location label, here the path as written in the configuration.
+    // Replicas of the same site are named by their label, which here is the pattern as written in the configuration.
     let mut expected = vec!["source".to_string()];
     expected.extend(projects.iter().map(|p| format!("dest ({}/main_style.md)", p.display())));
     assert_eq!(replica_names(&eng, 0), expected);
 }
 
-/// YAML for the style-guide relation of case 4: a literal source file mirrored into each project found under `projects_dir`.
+/// YAML for the case 4 relation, which copies a single source file into each project folder under `projects_dir`.
 fn style_guide_fan_out(rules: &Path, projects_dir: &Path) -> String {
     format!(
         "    style-guide-all:\n      sites:\n        source: \"{}/main_style.md\"\n        dest: \"{}/{{project}}/docs/style/main_style.md\"\n      fanout: [project]\n      flow: \"source -> dest [edit create]\"\n",
@@ -193,7 +193,7 @@ fn case_4_discovered_fan_out() {
         write(projects_dir.join(p).join("docs/style/main_style.md"), "old");
     }
 
-    // The fan-out variable is bound to each directory found under Projects, one replica per project.
+    // The fanout variable matches each folder under Projects, giving a replica per project.
     let eng = engine(&tmp, &style_guide_fan_out(&rules, &projects_dir));
 
     eng.cycle(None).unwrap();
@@ -201,12 +201,12 @@ fn case_4_discovered_fan_out() {
         assert_eq!(read(projects_dir.join(p).join("docs/style/main_style.md")).unwrap(), "v1");
     }
 
-    // A project directory added later is discovered on the next cycle and receives the style guide through the create edge.
+    // A project folder added later is found on the next cycle and gets the style guide over the create edge.
     fs::create_dir_all(projects_dir.join("screamio")).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(projects_dir.join("screamio/docs/style/main_style.md")).unwrap(), "v1");
 
-    // Fan-out replicas are named by the value bound to the variable.
+    // Fanout replicas are named by the value of the fanout variable.
     assert_eq!(replica_names(&eng, 0), vec!["source", "dest (bouncer)", "dest (duckmaster)", "dest (screamio)"]);
 }
 
@@ -219,17 +219,17 @@ fn case_4_discovered_fan_out_seeds_the_projects_present_at_start() {
     for p in ["bouncer", "duckmaster"] {
         write(projects_dir.join(p).join("docs/style/main_style.md"), "old");
     }
-    // A project folder with no docs yet is still a replica, since the variable is bound at the Projects level.
+    // A project folder without a docs folder still gets a replica, because the variable matches the folders directly under Projects.
     fs::create_dir_all(projects_dir.join("screamio")).unwrap();
 
-    // On the first cycle the source content is copied to each project found under Projects, to the empty one through the create edge.
+    // The first cycle copies the source content into each project. screamio has no file yet, so it gets one over the create edge.
     let eng = engine(&tmp, &style_guide_fan_out(&rules, &projects_dir));
     eng.cycle(None).unwrap();
     for p in ["bouncer", "duckmaster", "screamio"] {
         assert_eq!(read(projects_dir.join(p).join("docs/style/main_style.md")).unwrap(), "v1");
     }
 
-    // A later edit at the source fans out to each replica; an edit at a project has no edge to leave by and is reverted.
+    // A later edit at the source reaches each project. An edit at a project has no edge to leave by, so it is reverted.
     write(rules.join("main_style.md"), "v2");
     eng.cycle(None).unwrap();
     write(projects_dir.join("bouncer/docs/style/main_style.md"), "local heresy");
@@ -238,7 +238,7 @@ fn case_4_discovered_fan_out_seeds_the_projects_present_at_start() {
         assert_eq!(read(projects_dir.join(p).join("docs/style/main_style.md")).unwrap(), "v2");
     }
 
-    // Fan-out replicas are named by the value bound to the variable, in directory order.
+    // Fanout replicas are named by the value of the fanout variable and listed in folder order.
     assert_eq!(replica_names(&eng, 0), vec!["source", "dest (bouncer)", "dest (duckmaster)", "dest (screamio)"]);
 }
 
@@ -256,13 +256,13 @@ fn case_5_path_template_rewrite() {
         flat.display(), nested.display()
     ));
 
-    // The variable bound from a source file name is substituted into the nested destination pattern.
+    // The value of `{name}` from a source file name is substituted into the nested dest pattern.
     eng.cycle(None).unwrap();
     assert_eq!(read(nested.join("humanizer/SKILL.md")).unwrap(), "no em dashes");
     // The text file does not match `{name}.md`, so it is not a key of the relation.
     assert_eq!(read(nested.join("notes.txt")), None);
 
-    // Edits on either side travel through the rewrite in both directions.
+    // Edits travel between the flat and nested names in both directions.
     write(flat.join("prose.md"), "write plainly, v2");
     eng.cycle(None).unwrap();
     assert_eq!(read(nested.join("prose/SKILL.md")).unwrap(), "write plainly, v2");
@@ -270,11 +270,11 @@ fn case_5_path_template_rewrite() {
     eng.cycle(None).unwrap();
     assert_eq!(read(flat.join("prose.md")).unwrap(), "write plainly, v3");
 
-    // A variable appearing on some sites only is refused, with the variable itself quoted in the message.
+    // A variable on only some sites is rejected with an error that names it.
     let err = load_error("relations:\n    bad:\n      sites: { a: \"/x/{name}.md\", b: \"/y/{other}/f.md\" }\n      flow: \"a <-> b\"\n");
     assert!(err.contains("{name}") || err.contains("{other}"), "unexpected error: {err}");
 
-    // A pattern with a variable on one side and a whole folder on the other is refused for the same reason.
+    // A `{name}` pattern paired with a whole folder is rejected for the same reason.
     assert!(load("relations:\n    bad2:\n      sites: { a: \"/x/{name}.md\", b: \"/y/\" }\n      flow: \"a <-> b\"\n").is_err());
 }
 
@@ -290,17 +290,17 @@ fn lifecycle_create_restore_and_propagate() {
 
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("only-here.txt")), None);
-    // A file present on one side with no edge to carry it is not awaiting anything.
+    // With no create edge, only-here.txt stays where it is and the relation still counts as in sync.
     let report = eng.report();
     assert_eq!(report.relations[0].state(false), RelationState::InSync);
     assert!(!report.relations[0].rows.iter().find(|r| r.key == "only-here.txt").unwrap().needs_attention());
 
-    // Without a create edge a deleted copy stays deleted.
+    // Without a create edge, a deleted copy stays deleted.
     fs::remove_file(b.join("f.txt")).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")), None);
 
-    // A create edge into dest fills the empty spot from the source copy and brings in only-here.txt; a later deletion is restored the same way.
+    // With a create edge into dest, the missing f.txt is restored from source and only-here.txt is copied over. A later deletion at dest is restored the same way.
     let eng2 = engine(&tmp, &pair("g2", &a, &b, "source <-> dest [edit]; source -> dest [create]"));
     eng2.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "hello");
@@ -309,7 +309,7 @@ fn lifecycle_create_restore_and_propagate() {
     eng2.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "hello");
 
-    // A delete edge carries the removal of the source copy to dest.
+    // With a delete edge, deleting the file at source deletes it at dest too.
     let eng3 = engine(&tmp, &pair("g3", &a, &b, "source <-> dest [edit]; source -> dest [delete]"));
     eng3.cycle(None).unwrap();
     fs::remove_file(a.join("f.txt")).unwrap();
@@ -329,14 +329,14 @@ fn conflict_skips_without_a_rule_and_mtime_breaks_the_tie() {
     let eng = engine(&tmp, &pair("g", &a, &b, "source <-> dest [edit]"));
     eng.cycle(None).unwrap();
 
-    // Differing edits on both sides are held, so each file keeps its own content.
+    // Different edits on both sides are a conflict, so the key is held and each file keeps its content.
     write(a.join("f.txt"), "from a");
     write(b.join("f.txt"), "from b");
     eng.cycle(None).unwrap();
     assert_eq!(read(a.join("f.txt")).unwrap(), "from a");
     assert_eq!(read(b.join("f.txt")).unwrap(), "from b");
 
-    // Under an mtime rule the newer file wins the contest.
+    // With an mtime rule, the newer file wins.
     let eng2 = engine(&tmp, &format!("{}      resolve: \"source mtime dest\"\n", pair("g2", &a, &b, "source <-> dest [edit]")));
     set_mtime(a.join("f.txt"), 1_000);
     set_mtime(b.join("f.txt"), 2_000);
@@ -360,14 +360,14 @@ fn unsettled_conflict_persists_while_the_rest_syncs() {
     ));
     eng.cycle(None).unwrap();
 
-    // The paths from a and c meet at d, so d is held while b takes the edit from a.
+    // Edits from a and c both reach d, so d is held while b takes the edit from a.
     write(a.join("f.txt"), "from a");
     write(c.join("f.txt"), "from c");
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "from a");
     assert_eq!(read(d.join("f.txt")).unwrap(), "base");
 
-    // The conflict at d stays visible on later cycles although no file changed since the last one.
+    // The conflict at d stays on the report in later cycles, even though no file has changed.
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
     let report = eng.report();
@@ -376,10 +376,10 @@ fn unsettled_conflict_persists_while_the_rest_syncs() {
     assert!(row.needs_attention());
     assert_eq!(report.relations[0].state(false), RelationState::Awaiting(1));
     assert_eq!(read(d.join("f.txt")).unwrap(), "base");
-    // A conflict unchanged since the last cycle is not reported again.
+    // The conflict is reported once, when it first appears.
     assert_eq!(count(&events, "skipped quad f.txt"), 1, "{:?}", events.lock().unwrap());
 
-    // Once a and c agree, d conforms and the conflict clears.
+    // Once a and c agree, d takes their content and the conflict clears.
     write(c.join("f.txt"), "from a");
     eng.cycle(None).unwrap();
     assert_eq!(read(d.join("f.txt")).unwrap(), "from a");
@@ -400,14 +400,14 @@ fn self_writes_do_not_churn() {
     eng.cycle(None).unwrap();
     write(a.join("f.txt"), "v2");
     eng.cycle(None).unwrap();
-    // The resolved event carries the plan text. The first cycle only aligned the records of two identical files.
+    // Each resolved event carries its plan text. The first cycle found two identical files and only recorded them.
     let resolved: Vec<String> = events.lock().unwrap().iter().filter(|l| l.starts_with("resolved")).cloned().collect();
     assert_eq!(resolved, vec![
         "resolved g f.txt: resolved: records aligned, no files changed",
         "resolved g f.txt: resolved: copy source -> dest",
     ]);
 
-    // The written copy matches its record on later cycles, so nothing rewrites it.
+    // The copy at dest matches its record on later cycles, so it is left alone.
     let b_mtime = fs::metadata(b.join("f.txt")).unwrap().modified().unwrap();
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
@@ -429,12 +429,12 @@ fn stale_intent_is_reported_and_instance_resolves_fresh() {
     {
         let eng = build(&tmp, &db, load(&yaml).unwrap(), vec![]);
         eng.cycle(None).unwrap();
-        // A journal row without a commit plus a half-written destination stands in for a run killed mid-plan.
+        // An intent row with no commit and a half-written file at dest simulate a process killed mid-plan.
         eng.store.write_intent("g", &Key::parse("path=f.txt"), "copy source -> dest").unwrap();
         write(b.join("f.txt"), "torn write");
     }
 
-    // The next instance reports the stale row through its hook, clears it, then reconciles the key from the files as they stand.
+    // A new engine reports the stale intent through its hook and clears it. The next cycle then reconciles the key from the files on disk.
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen2 = seen.clone();
     let hook: Hook = Box::new(move |e: &Event| {
@@ -448,7 +448,7 @@ fn stale_intent_is_reported_and_instance_resolves_fresh() {
     assert_eq!(cleared.len(), 1);
     assert_eq!(cleared[0].detail, "copy source -> dest");
     eng.cycle(None).unwrap();
-    // The torn write differs from the recorded basis, so it reads as an edit at dest and travels to source.
+    // The torn write differs from its record, so it counts as an edit at dest and is copied to source.
     assert_eq!(read(a.join("f.txt")).unwrap(), "torn write");
 }
 
@@ -460,7 +460,7 @@ fn arbitrary_site_names_beyond_source_and_dest() {
     write(b.join("f.txt"), "v1");
     write(c.join("f.txt"), "v1");
 
-    // Site names are free, a leading dollar sign included; the flow refers to them in a braced set.
+    // Sites can have any name, even one starting with a dollar sign. The flow lists two of them in braces.
     let eng = engine(&tmp, &format!(
         "    tri:\n      sites:\n        first: \"{}/\"\n        second: \"{}/\"\n        \"$backup\": \"{}/\"\n      flow: \"first -> {{second, $backup}} [edit]\"\n",
         a.display(), b.display(), c.display()
@@ -471,7 +471,7 @@ fn arbitrary_site_names_beyond_source_and_dest() {
     assert_eq!(read(b.join("f.txt")).unwrap(), "v2");
     assert_eq!(read(c.join("f.txt")).unwrap(), "v2");
 
-    // The loader refuses an undeclared site, a flow carrying nothing, a field of the first design.
+    // The loader rejects a flow that names an undeclared site, a relation with no flow, and an unknown field.
     let rejects = |yaml: &str, needle: &str| {
         let err = load_error(yaml);
         assert!(err.contains(needle), "unexpected error: {err}");
@@ -491,14 +491,14 @@ fn gate_holds_writes_and_reports_the_plan() {
     let (eng, events) = engine_with_events(&tmp, &pair("g", &a, &b, "source <-> dest [edit]"));
     eng.cycle(None).unwrap();
 
-    // Under the closed global gate the plan is computed and reported while the destination keeps its old content.
+    // While the global gate is closed, the plan is computed and reported, but dest keeps its old content.
     eng.gates.set_global(true);
     write(a.join("f.txt"), "v2");
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");
-    // A held plan unchanged since the last cycle is not reported again.
+    // The held plan is reported once, even though three cycles held it.
     assert_eq!(count(&events, "held g f.txt"), 1, "{:?}", events.lock().unwrap());
 
     // The report shows the held plan on the row for f.txt.
@@ -508,11 +508,11 @@ fn gate_holds_writes_and_reports_the_plan() {
     assert_eq!(row.plan_text, "copy source -> dest");
     assert_eq!(report.relations[0].state(true), RelationState::Held(1));
 
-    // Opening the gate lets the next cycle apply the deferred write.
+    // After the gate opens, the next cycle applies the held write.
     eng.gates.set_global(false);
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v2");
-    // A new edit under a closed gate is reported again, since the previous hold was resolved.
+    // A new edit under a closed gate is reported as held again, because the earlier hold was resolved.
     eng.gates.set_global(true);
     write(a.join("f.txt"), "v2b");
     eng.cycle(None).unwrap();
@@ -522,7 +522,7 @@ fn gate_holds_writes_and_reports_the_plan() {
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v2b");
 
-    // A relation may start with its own gate closed from the configuration.
+    // With `gate: true` in the configuration, the relation starts with its own gate closed.
     let loaded = load(&format!("relations:\n{}      gate: true\n", pair("g", &a, &b, "source <-> dest [edit]"))).unwrap();
     assert!(loaded.relations[0].gate_default);
     let eng2 = build(&tmp, &tmp.path().join("state2.db"), loaded, vec![]);
@@ -530,7 +530,7 @@ fn gate_holds_writes_and_reports_the_plan() {
     write(a.join("f.txt"), "v3");
     eng2.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v2b");
-    // A gated cycle records nothing, so the sides are realigned by hand before the gate opens and the baseline is taken.
+    // A gated cycle records nothing, so source is set back to match dest before the gate opens. The first ungated cycle then records matching files.
     write(a.join("f.txt"), "v2b");
     eng2.set_relation_gate("g", false);
     eng2.cycle(None).unwrap();
@@ -552,7 +552,7 @@ fn archive_keeps_overwritten_and_deleted_content() {
     let dir = eng.blobs.dir.clone();
     eng.cycle(None).unwrap();
 
-    // An overwrite and a deletion at dest each leave the displaced content in the blob store with an archive row.
+    // When a file at dest is overwritten or deleted, its old content goes into the blob store with an archive row.
     write(a.join("f.txt"), "new content");
     fs::remove_file(a.join("gone.txt")).unwrap();
     eng.cycle(None).unwrap();
@@ -569,23 +569,23 @@ fn archive_keeps_overwritten_and_deleted_content() {
 
     // Identical content archived from different paths is stored once.
     write(a.join("f.txt"), "delete me");
-    eng.cycle(None).unwrap();  // b/f.txt is overwritten, archiving "new content".
+    eng.cycle(None).unwrap();  // b/f.txt is overwritten and "new content" is archived.
     write(a.join("f.txt"), "final");
-    eng.cycle(None).unwrap();  // b/f.txt is overwritten again, so "delete me" is archived; its blob is already there from gone.txt.
+    eng.cycle(None).unwrap();  // b/f.txt is overwritten again and "delete me" is archived, but its blob is already stored from gone.txt.
     let (rows, bytes) = eng.store.archive_stats().unwrap();
     assert_eq!(rows, 4);
     let unique: std::collections::BTreeSet<String> = eng.store.archive_entries("g").unwrap().into_iter().map(|e| hex(&e.hash)).collect();
     assert_eq!(unique.len(), 3, "'delete me' must be stored once");
     assert_eq!(bytes as usize, "old content".len() + "new content".len() + "delete me".len());
 
-    // A tiny cap evicts the older rows while the row just written survives.
+    // With a tiny cap, the older rows are evicted and only the newest row is kept.
     eng.blobs = Blobs { dir: dir.clone(), cap: 1 };
     write(a.join("f.txt"), "post-cap");
     eng.cycle(None).unwrap();
     let entries = eng.store.archive_entries("g").unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(read(dir.join(hex(&entries[0].hash))).unwrap(), "final");
-    // An evicted blob leaves the disk with its last row.
+    // A blob is deleted from disk when its last archive row is evicted.
     assert!(!dir.join(blake3::hash(b"old content").to_hex().to_string()).exists());
 }
 
@@ -601,7 +601,7 @@ fn overlapping_roots_are_reported_and_skipped_while_the_rest_syncs() {
 
     let flow = "source <-> dest [edit]; source -> dest [create]";
     let (eng, events) = engine_with_events(&tmp, &format!("{}{}{}", pair("g1", &a, &c, flow), pair("g2", &nested, &d, flow), pair("g3", &e, &f, flow)));
-    // The cycle as a whole succeeds: the overlapping pair is reported and skipped while the third relation syncs.
+    // The cycle succeeds. The two relations with overlapping roots are reported and skipped while g3 syncs.
     eng.cycle(None).unwrap();
     assert_eq!(read(c.join("f.txt")), None);
     assert_eq!(read(d.join("g.txt")), None);
@@ -610,7 +610,7 @@ fn overlapping_roots_are_reported_and_skipped_while_the_rest_syncs() {
     assert_eq!(errors.len(), 2, "{errors:?}");
     assert!(errors.iter().all(|l| l.contains("overlapping roots")), "{errors:?}");
     assert!(errors.iter().any(|l| l.starts_with("error g1 ")) && errors.iter().any(|l| l.starts_with("error g2 ")), "{errors:?}");
-    // The report shows the same error on both relations; the second cycle does not repeat it.
+    // The report shows the error on both relations. A second cycle emits no new error events.
     let report = eng.report();
     assert!(report.relations[0].error.as_deref().unwrap_or("").contains("overlapping roots"));
     assert!(report.relations[1].error.as_deref().unwrap_or("").contains("overlapping roots"));
@@ -627,7 +627,7 @@ fn literal_file_patterns_claim_one_file_not_their_folder() {
     write(conf.join("default.conf"), "server {}");
     write(lib.join("app.js"), "1");
 
-    // The renamed file is written into Desktop, which also contains the mylibrary root; the footprints do not overlap, so both relations run.
+    // nginx-conf.txt goes into Desktop, which also holds the mylibrary root. A single-file site covers only its file, so the roots do not overlap and both relations run.
     let flow = "source <-> dest [edit]; source -> dest [create]";
     let eng = engine(&tmp, &format!(
         "    nginx:\n      sites: {{ source: \"{}/default.conf\", dest: \"{}/nginx-conf.txt\" }}\n      flow: \"{flow}\"\n{}",
@@ -645,7 +645,7 @@ fn reserved_paths_inside_a_root_are_refused() {
     let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
     write(a.join("f.txt"), "x");
     let (mut eng, events) = engine_with_events(&tmp, &pair("g", &a, &b, "source <-> dest [edit]; source -> dest [create]"));
-    // A relation log inside a root is refused, since the daemon's own writes there turn into endless edits.
+    // A relation log inside a root is rejected, since each write to the log shows up as an edit on the next cycle.
     eng.reserved = vec![a.join("logs/g.log")];
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")), None);
@@ -661,7 +661,7 @@ fn profile_defaults_and_variable_expansion() {
     let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
     write(a.join("f.txt"), "hello");
 
-    // The relation takes its flow from the default profile; the log path expands ${state} and ${relation}.
+    // The relation gets its flow and log from the default profile. The log path expands `${state}` and `${relation}`.
     let state = tmp.path().join("live");
     let yaml = format!(
         "state: \"{}\"\nprofiles:\n    _:\n      flow: \"source <-> dest [edit]; source -> dest [create]\"\n      log: \"${{state}}/logs/${{relation}}.log\"\nrelations:\n    g:\n      sites: {{ source: \"{}/\", dest: \"{}/\" }}\n",
@@ -673,21 +673,21 @@ fn profile_defaults_and_variable_expansion() {
 
     let eng = build(&tmp, &loaded.settings.db_path().unwrap(), loaded, vec![]);
     eng.cycle(None).unwrap();
-    // The create edge inherited from the profile brings the file to dest.
+    // The create edge from the profile copies the file to dest.
     assert_eq!(read(b.join("f.txt")).unwrap(), "hello");
 
-    // A field written on the relation replaces the same field of the profile.
+    // A field set on the relation overrides the same field in the profile.
     let yaml2 = "profiles:\n    _:\n      flow: \"source <-> dest [edit]\"\n      where: { path: \"*.md\" }\nrelations:\n    h:\n      sites: { source: /tmp/x/, dest: /tmp/y/ }\n      where: { path: \"*.js\" }\n";
     let loaded = load(yaml2).unwrap();
     let pattern = &loaded.relations[0].sites[0].locations[0].pattern;
     assert!(pattern.matches(Path::new("/tmp/x/a.js")).is_some());
     assert!(pattern.matches(Path::new("/tmp/x/a.md")).is_none());
 
-    // Patterns with variables are accepted as plain strings.
+    // Patterns with variables load as plain YAML strings.
     let yaml3 = "relations:\n    t:\n      sites: { source: \"/x/{name}.md\", dest: \"/y/{name}/SKILL.md\" }\n      flow: \"source <-> dest [edit]\"\n";
     assert!(load(yaml3).is_ok());
 
-    // Variables referring to each other in a cycle are refused.
+    // Variables that refer to each other in a loop are rejected.
     let yaml4 = "relations:\n    g:\n      vars: { a: \"${b}\", b: \"${a}\" }\n      sites: { source: /tmp/x/, dest: /tmp/y/ }\n      flow: \"source <-> dest [edit]\"\n      log: \"${a}\"\n";
     let err = match load(yaml4) {
         Err(e) => e.root_cause().to_string(),
@@ -706,20 +706,20 @@ fn missing_recorded_root_is_not_a_mass_deletion() {
     let (eng, events) = engine_with_events(&tmp, &pair("g", &a, &b, "source <-> dest [edit delete]"));
     eng.cycle(None).unwrap();
 
-    // The whole destination folder vanishes, as happens with an unmounted volume or a renamed root.
-    // A root with records but no folder is treated as unavailable, so the deletion does not travel to source.
+    // The whole dest folder disappears, as it does when a volume is unmounted or a root is renamed.
+    // A missing root that has records is treated as unavailable, so the deletions do not travel to source.
     fs::remove_dir_all(&b).unwrap();
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(a.join("f.txt")).unwrap(), "precious");
-    // The report applies the same guard: no rows, no delete plan, an unavailable reason, reported once.
+    // The report marks the relation unavailable, with the reason and no rows. The pending event is emitted once.
     let report = eng.report();
     assert!(report.relations[0].unavailable.as_deref().unwrap_or("").contains("folder is missing"));
     assert!(report.relations[0].rows.is_empty());
     assert_eq!(report.relations[0].state(false), RelationState::Unavailable);
     assert_eq!(count(&events, "pending g"), 1, "{:?}", events.lock().unwrap());
 
-    // Once the folder is back, cycles resume as before.
+    // Once the folder is back, syncing resumes.
     write(b.join("f.txt"), "precious");
     eng.cycle(None).unwrap();
     write(a.join("f.txt"), "precious v2");
@@ -736,7 +736,7 @@ fn markers_bracket_creates_and_deletes() {
 
     let eng = engine(&tmp, &pair("g", &a, &b, "source <-> dest [edit]; source -> dest [create delete]"));
 
-    // A create and a delete each place a marker beside the target and remove it when the operation commits.
+    // A create and a delete each put a marker beside the target file and remove it when the plan commits.
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");
     assert_eq!(read(b.join("f.txt.replica.tmp")), None);
@@ -746,7 +746,7 @@ fn markers_bracket_creates_and_deletes() {
     assert_eq!(read(b.join("f.txt")), None);
     assert_eq!(read(b.join("f.txt.replica.tmp")), None);
 
-    // A stray marker left by a crash is skipped by the walk, so no key is made from it.
+    // The walk skips a marker left behind by a crash, so the marker does not become a key.
     write(b.join("g.txt.replica.tmp"), "service: replica\nop: create\n");
     eng.cycle(None).unwrap();
     assert_eq!(read(a.join("g.txt.replica.tmp")), None);
@@ -765,7 +765,7 @@ fn narrowed_pattern_drops_recorded_files_it_no_longer_covers() {
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("notes.md")).unwrap(), "md v1");
 
-    // The same relation narrowed to *.js: notes.md has records, but the constraint no longer admits it.
+    // The same relation is narrowed to *.js. notes.md still has records, but it no longer matches.
     let eng2 = engine(&tmp, &format!("{}      where: {{ path: \"*.js\" }}\n", pair("g", &a, &b, flow)));
     write(a.join("notes.md"), "md v2");
     write(a.join("app.js"), "js v2");
@@ -783,7 +783,7 @@ fn pattern_depth_still_finds_files_in_named_subfolders() {
     write(a.join("docs/sub/deeper.md"), "deeper");
     write(a.join("top.md"), "top");
 
-    // A constraint with a fixed segment count bounds the walk, so files above or below that depth are left alone.
+    // The constraint `docs/*.md` matches only files directly inside docs, so top.md and docs/sub/deeper.md are not copied.
     let eng = engine(&tmp, &format!("{}      where: {{ path: \"docs/*.md\" }}\n", pair("g", &a, &b, "source <-> dest [edit]; source -> dest [create]")));
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("docs/guide.md")).unwrap(), "deep");
@@ -825,7 +825,7 @@ fn an_edit_made_while_the_peer_is_unreadable_is_delivered_once_the_peer_returns(
     eng.cycle(None).unwrap();
     let seeded = count(&events, "resolved");
 
-    // dest/f.txt becomes a directory, so dest is unreadable; the edit at source waits with its basis unchanged.
+    // dest/f.txt is replaced by a directory, so dest is unreadable. The edit at source waits and keeps its old basis.
     fs::remove_file(b.join("f.txt")).unwrap();
     fs::create_dir_all(b.join("f.txt")).unwrap();
     write(a.join("f.txt"), "v2");
@@ -834,7 +834,7 @@ fn an_edit_made_while_the_peer_is_unreadable_is_delivered_once_the_peer_returns(
     assert!(events.lock().unwrap().iter().any(|l| l.contains("waiting on dest: unreadable")), "{:?}", events.lock().unwrap());
     assert_eq!(count(&events, "resolved"), seeded, "nothing resolves while the peer is unreadable: {:?}", events.lock().unwrap());
 
-    // The directory goes away and the old file comes back: the pending edit is delivered to it.
+    // When the directory is replaced by the old file, the waiting edit is copied to it.
     fs::remove_dir(b.join("f.txt")).unwrap();
     write(b.join("f.txt"), "v1");
     eng.cycle(None).unwrap();
@@ -855,7 +855,7 @@ fn an_edit_at_the_recovered_peer_conflicts_with_the_edit_made_while_it_was_unrea
     fs::create_dir_all(b.join("f.txt")).unwrap();
     write(a.join("f.txt"), "v2");
     eng.cycle(None).unwrap();
-    // The peer returns with an edit of its own: both sides moved since the baseline, so the key is held as a conflict.
+    // dest comes back with its own edit. Both sides changed since their records, so the key is held as a conflict.
     fs::remove_dir(b.join("f.txt")).unwrap();
     write(b.join("f.txt"), "v1-edited");
     eng.cycle(None).unwrap();
@@ -878,7 +878,7 @@ fn a_deletion_made_while_the_peer_is_unreadable_still_propagates_later() {
     fs::create_dir_all(b.join("f.txt")).unwrap();
     fs::remove_file(a.join("f.txt")).unwrap();
     eng.cycle(None).unwrap();
-    // The record at source still says the file existed, so the deletion is still pending when the peer is readable again.
+    // The record at source still has the file, so the deletion is still pending when dest is readable again.
     fs::remove_dir(b.join("f.txt")).unwrap();
     write(b.join("f.txt"), "v1");
     eng.cycle(None).unwrap();
@@ -897,11 +897,11 @@ fn records_outside_a_narrowed_pattern_are_forgotten() {
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("notes.md")).unwrap(), "md v1");
 
-    // Narrowed to *.js, notes.md leaves the relation and its records go with it.
+    // Once the relation is narrowed to *.js, notes.md is no longer a key and its records are dropped.
     let eng2 = engine(&tmp, &format!("{}      where: {{ path: \"*.js\" }}\n", pair("g", &a, &b, flow)));
     eng2.cycle(None).unwrap();
     assert!(eng2.store.records_for("g").unwrap().get(&Key::parse("path=notes.md").canonical()).is_none());
-    // While narrowed, the person replaces notes.md on both sides; widening again must not read that as a deletion against the old baseline.
+    // While the relation is narrowed, notes.md is deleted on both sides and recreated at source. The old records are gone, so after the relation is widened again, the missing copy at dest does not count as a deletion.
     fs::remove_file(a.join("notes.md")).unwrap();
     fs::remove_file(b.join("notes.md")).unwrap();
     write(a.join("notes.md"), "md v2");
@@ -914,7 +914,7 @@ fn records_outside_a_narrowed_pattern_are_forgotten() {
 
 #[test]
 fn a_variable_on_one_side_against_a_literal_file_is_rejected_at_load() {
-    // The path variable appears on source alone, since dest is a single file, so the loader asks for a fanout entry or a matching variable.
+    // The `{path}` variable appears only on source, because dest is a single file. The error suggests a fanout entry or a matching variable.
     let err = load_error("relations:\n    fx:\n      sites: { source: /conf.d/, dest: /Desktop/x.txt }\n      where: { path: \"*.conf\" }\n      flow: \"source <-> dest [edit]; source -> dest [create]\"\n");
     assert!(err.contains("fanout"), "unexpected error: {err}");
     assert!(err.contains("{path}"), "unexpected error: {err}");
@@ -934,7 +934,7 @@ fn a_failed_write_is_an_error_with_context_and_leaves_no_journal_behind() {
     let (eng, events) = engine_with_events(&tmp, &pair("g", &a, &b, "source <-> dest [edit]"));
     eng.cycle(None).unwrap();
 
-    // A read-only destination folder keeps the temporary file from being created.
+    // The dest folder is read-only, so the temporary file cannot be created.
     fs::set_permissions(&b, fs::Permissions::from_mode(0o500)).unwrap();
     write(a.join("f.txt"), "v2");
     eng.cycle(None).unwrap();
@@ -942,7 +942,7 @@ fn a_failed_write_is_an_error_with_context_and_leaves_no_journal_behind() {
     let errors: Vec<String> = events.lock().unwrap().iter().filter(|l| l.starts_with("error g f.txt")).cloned().collect();
     assert_eq!(errors.len(), 1, "{:?}", events.lock().unwrap());
     assert!(errors[0].contains("creating temp file") && errors[0].contains("f.txt"), "{}", errors[0]);
-    // The intent row is cleared, no marker is left, the records are as they were, so the next cycle retries.
+    // After the failure, the intent row is cleared, no marker is left, and the records are unchanged. The next cycle then retries the write.
     assert!(eng.store.stale_intents().unwrap().is_empty());
     assert!(fs::read_dir(&b).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("replica")));
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");

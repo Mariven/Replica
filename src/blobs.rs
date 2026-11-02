@@ -1,7 +1,7 @@
 //! The content-addressed blob store beside the state database.
 //!
-//! The store holds archived revisions of overwritten and deleted files, along with donor content staged while a plan applies and the output of transforms. Each blob is a file named by the hex of its BLAKE3 hash. The bytes go into a temporary sibling first and are renamed into place, so after a crash any blob found under its final name is complete.
-//! The `archive` table of the state database records the archived revisions, each with its blob hash and origin. The store itself is a flat map from hash to bytes.
+//! It holds copies of overwritten and deleted files, the content staged for each write in a plan, and the output of transforms. Each blob is a file named by the hex of its BLAKE3 hash. New content is written to a temporary file and renamed into place, so after a crash any blob under its final name is complete.
+//! The store keeps only bytes, filed under their hashes. The `archive` table of the state database records where each archived revision came from.
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -12,14 +12,14 @@ use anyhow::{Context, Result};
 use crate::observe::{Hash, from_hex, hex};
 use crate::store::Store;
 
-/// The blob directory, plus the byte cap on archived revisions. Eviction starts once they exceed it.
+/// The blob directory and the size cap for archived revisions. Old revisions are evicted when the archive grows past the cap.
 #[derive(Clone, Debug)]
 pub struct Blobs {
     pub dir: PathBuf,
     pub cap: u64,
 }
 
-/// Count bytes passing through a reader while hashing them.
+/// A reader wrapper that hashes and counts the bytes read through it.
 struct Counting<'a, R: Read> {
     inner: R,
     hasher: &'a mut blake3::Hasher,
@@ -41,7 +41,7 @@ impl Blobs {
         self.dir.join(hex(hash))
     }
 
-    /// Path of the blob for a hex digest. A malformed digest is rejected, which keeps dashboard requests inside the blob directory.
+    /// Path of the blob for a hex digest. Only a well-formed digest is accepted, so a dashboard request cannot point outside the blob directory.
     pub fn path_for_hex(&self, digest: &str) -> Result<PathBuf> {
         let hash = from_hex(digest).with_context(|| format!("not a content hash: {digest:?}"))?;
         Ok(self.path(&hash))
@@ -57,14 +57,14 @@ impl Blobs {
         fs::File::open(self.path(hash)).with_context(|| format!("blob {}", hex(hash)))
     }
 
-    /// Stream content into the store, returning its hash and size. Content already present is left as it is.
+    /// Copy content into the store and return its hash and size. If a blob with that hash already exists, the existing blob is kept and the new copy is discarded.
     pub fn stage(&self, content: &mut dyn Read) -> Result<(Hash, u64)> {
         fs::create_dir_all(&self.dir).with_context(|| format!("creating blob dir {}", self.dir.display()))?;
-        // The hash is known only once all the bytes have passed, so they go into a uniquely named temporary file first.
+        // The hash is unknown until all the bytes are read, so they are written to a temporary file with a unique name first.
         let tmp = self.dir.join(format!(".staging-{}-{}", std::process::id(), unique_suffix()));
         let mut hasher = blake3::Hasher::new();
         let (hash, size) = {
-            // Blobs may hold private content, so the file is readable by the owner alone.
+            // Blobs may hold private content, so only the owner can read the file.
             let mut f = {
                 use std::os::unix::fs::OpenOptionsExt;
                 fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp).with_context(|| format!("creating staging file {}", tmp.display()))?
@@ -94,12 +94,12 @@ impl Blobs {
         Ok((hash, size))
     }
 
-    /// Stage bytes held in memory.
+    /// Stage bytes that are already in memory.
     pub fn stage_bytes(&self, bytes: &[u8]) -> Result<(Hash, u64)> {
         self.stage(&mut &bytes[..])
     }
 
-    /// Remove the blob for a hash when no archive row refers to it.
+    /// Remove the blob for a hash if no archive row refers to it.
     pub fn sweep(&self, store: &Store, hash: &Hash) -> Result<()> {
         if store.archive_refcount(hash)? == 0 {
             let _ = fs::remove_file(self.path(hash));
@@ -107,7 +107,7 @@ impl Blobs {
         Ok(())
     }
 
-    /// Evict archived revisions until their unique bytes fit under the cap. On each round, this loop finds the relation with the most archived bytes and deletes its oldest row; row `keep`, inserted a moment ago, is exempt. A blob with no rows left is removed from disk.
+    /// Evict archived revisions until their total size fits under the cap. The oldest row of the relation with the most archived bytes is deleted first, along with its blob if no other row refers to it. Row `keep` is exempt, so the caller can protect the revision it has just archived.
     pub fn evict(&self, store: &Store, keep: i64) -> Result<()> {
         while store.archive_unique_bytes()? > self.cap {
             let Some(relation) = store.archive_largest_relation(keep)? else { break };
@@ -129,7 +129,7 @@ impl Blobs {
     }
 }
 
-/// A suffix unique within the process, so concurrent stagings each get a temporary file of their own.
+/// A number unique within the process, so that concurrent calls to `stage` use different temporary files.
 fn unique_suffix() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);

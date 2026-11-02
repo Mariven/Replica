@@ -1,4 +1,4 @@
-//! HTML for the dashboard pages. The main page is assembled region by region: the header, the status strip, unfinished operations, a section per relation, and the activity list.
+//! HTML for the dashboard pages. From top to bottom, the main page has the header, the status strip, any unfinished operations, a section for each relation, and the activity list.
 
 use std::fs;
 use std::sync::atomic::Ordering;
@@ -23,15 +23,15 @@ const HEAD: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>re
     <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">\
     <link rel=\"stylesheet\" href=\"/style.css\">";
 
-/// A relation's table is cut off after this many rows. The cap applies separately to pending rows and to rows in sync.
+/// Rows shown in a relation's table before it is cut off. Pending rows and rows in sync each get this many.
 const ROW_CAP: usize = 50;
-/// The history page is cut off after this many archived versions.
+/// Archived versions shown on the history page before it is cut off.
 const HISTORY_CAP: usize = 100;
 
-/// Everything the main page renders.
+/// The inputs to the main page.
 pub struct PageData<'a> {
     pub snap: &'a Snapshot,
-    /// The snapshot comes from an earlier cycle because a cycle is running now.
+    /// True if a cycle is running and the snapshot is from the end of the previous one.
     pub stale: bool,
     pub recent: &'a [Stamped],
     pub rt: &'a Runtime,
@@ -46,12 +46,12 @@ fn page(head_extra: &str, body: &str) -> String {
     format!("{HEAD}{head_extra}</head><body>{body}</body></html>")
 }
 
-/// A colored tag.
+/// A tag, colored by its CSS class.
 fn tag(class: &str, text: &str) -> String {
     format!("<span class=\"tag {class}\">{}</span>", esc(text))
 }
 
-/// A one-button form. When the viewer presses the button, the browser posts to `action`.
+/// A form with a single button that posts to `action`. If `confirm` is given, the browser asks for confirmation first.
 fn button(action: &str, label: &str, class: &str, title: &str, confirm: Option<&str>) -> String {
     let onsubmit = confirm.map(|c| format!(" onsubmit=\"return confirm('{}')\"", esc(c))).unwrap_or_default();
     let class_attr = if class.is_empty() { String::new() } else { format!(" class=\"{class}\"") };
@@ -68,7 +68,7 @@ fn tone_class(t: Tone) -> &'static str {
     }
 }
 
-/// The switch between writing and gated. The current side renders as a highlighted label, the other side as a button. The viewer flips the gate by pressing that button.
+/// The writing/gated switch for a relation, or for all writes if `relation` is None. The current state shows as a highlighted label, and the other state is a button that flips the gate. With `disabled_note`, the switch does nothing and shows the note on hover.
 fn gate_switch(relation: Option<&str>, gated: bool, disabled_note: Option<&str>) -> String {
     let target = |to: &str| match relation {
         Some(rel) => format!("/gate?rel={}&to={to}", url_encode(rel)),
@@ -138,7 +138,7 @@ fn stat(label: &str, value: String) -> String {
     format!("<div class=\"stat\"><div class=\"stat-label\">{label}</div><div class=\"stat-value\">{value}</div></div>")
 }
 
-/// The status strip. Its cells cover the process, the configuration path, the database, sync timing, counters for this run, the blob store, and the overall state.
+/// The status strip below the header. It has cells for the process, the configuration path, the database, sync timing, the watch state, this run's counters, the archive, and the overall state.
 fn status_strip(v: &PageData, states: &[RelationState]) -> String {
     let (rt, report) = (v.rt, &v.snap.report);
     let now = SystemTime::now();
@@ -196,7 +196,7 @@ fn status_strip(v: &PageData, states: &[RelationState]) -> String {
     h
 }
 
-/// The unfinished-operations section. It lists the intent rows cleared at startup along with any still live in the store; a live row means a plan failed partway through during this run.
+/// The unfinished operations section, empty if there are none. It lists the intent rows cleared at startup and any still in the database. A row still in the database means a plan failed partway through during this run.
 fn unfinished(v: &PageData) -> String {
     let cleared = v.rt.cleared_intents.lock().unwrap();
     let live = v.snap.intents.as_ref().map(|i| i.as_slice()).unwrap_or(&[]);
@@ -217,7 +217,7 @@ fn unfinished(v: &PageData) -> String {
     h
 }
 
-/// The section header of a relation, holding its name, its file and location counts, its state tags, a link to its history, and its gate switch.
+/// A relation's section header, with its name, its file and location counts, its state tags, a link to its history, and its gate switch.
 fn relation_header(rel: &RelationReport, state: &RelationState, globally_gated: bool) -> String {
     let (awaiting, held) = rel.counts(globally_gated);
     let tags = match state {
@@ -235,7 +235,7 @@ fn relation_header(rel: &RelationReport, state: &RelationState, globally_gated: 
     )
 }
 
-/// The sites of a relation with their replicas' paths, flowing inline.
+/// A relation's sites, each followed by the patterns of its replicas. A replica whose root folder is missing gets a warning.
 fn locations(rel: &RelationReport) -> String {
     let mut h = String::from("<div class=\"locations\">");
     for site in &rel.sites {
@@ -249,7 +249,7 @@ fn locations(rel: &RelationReport) -> String {
     h
 }
 
-/// A cell of the file table.
+/// A file table cell, showing what was observed for a key at a replica and how it changed.
 fn cell(observation: &Observation, transition: Transition) -> String {
     match observation {
         Observation::Present(snap) => {
@@ -286,7 +286,7 @@ fn row(r: &RowView, gated: bool) -> String {
     h
 }
 
-/// The file table of a relation. Pending rows come first, then rows in sync; each group is cut at ROW_CAP unless the request carries `all=1` for this relation.
+/// A relation's file table. Pending rows come first, then rows in sync. Each group is cut off at ROW_CAP unless `show_all` is set, as it is when the request carries `all=1` for this relation.
 fn file_table(rel: &RelationReport, gated: bool, show_all: bool) -> String {
     if rel.rows.is_empty() {
         return "<div class=\"text-light\" style=\"margin-top:6px\">no files yet</div>".to_string();
@@ -317,7 +317,7 @@ fn file_table(rel: &RelationReport, gated: bool, show_all: bool) -> String {
     h
 }
 
-/// A relation's section: its header, its locations, any warnings, then its file table.
+/// A relation's section: its header, its locations, any warnings, then its file table. If the relation failed or is unavailable, the section ends early with a message in place of the table.
 fn relation_section(rel: &RelationReport, state: &RelationState, globally_gated: bool, show_all: bool) -> String {
     let mut h = format!("<section>{}", relation_header(rel, state, globally_gated));
     if let Some(e) = &rel.error {
@@ -355,7 +355,7 @@ fn activity(recent: &[Stamped]) -> String {
     h
 }
 
-/// The refresh script. On an interval it fetches the page again and swaps the body in place, so the page redraws without a flash. It skips a refresh while the tab is hidden or while text is selected. Once the daemon stops answering, it shows a banner over the stale page.
+/// A script that fetches the page every `seconds` seconds and replaces the body in place, so the page updates without a flash. It skips an update while the tab is hidden or text is selected. If a fetch fails, it shows a banner saying the page is stale.
 fn refresh_script(seconds: u64) -> String {
     format!(
         "<div id=\"unreachable\" class=\"banner bad\" hidden>replica is not answering; this page is stale</div>\
@@ -372,7 +372,7 @@ fn refresh_script(seconds: u64) -> String {
     )
 }
 
-/// The main page.
+/// The main page, built from a snapshot and the recent events.
 pub fn main_page(v: &PageData) -> String {
     let report: &Report = &v.snap.report;
     let states: Vec<RelationState> = report.relations.iter().map(|r| r.state(report.globally_gated)).collect();
@@ -388,7 +388,7 @@ pub fn main_page(v: &PageData) -> String {
     page("", &h)
 }
 
-/// A standalone notice, with a timed return to the main page when `reload` is set.
+/// A page with a single notice. If `reload` is set, the browser returns to the main page after five seconds.
 pub fn notice_page(title: &str, text: &str, reload: bool) -> String {
     page(
         if reload { "<meta http-equiv=\"refresh\" content=\"5;url=/\">" } else { "" },
@@ -396,7 +396,7 @@ pub fn notice_page(title: &str, text: &str, reload: bool) -> String {
     )
 }
 
-/// The history page of a relation. It lists archived versions newest first, with a download link wherever the blob is still on disk.
+/// A relation's history page, listing archived versions newest first. A version has a download link if its blob is still on disk.
 pub fn history_page(rel: &str, entries: Result<Vec<ArchiveEntry>, String>, blobs: &Blobs, all: bool) -> String {
     let mut h = format!("<header><a href=\"/\">&larr; back</a><span class=\"app-name\">Replica</span><span class=\"text-medium\">history of</span><b>{}</b></header>", esc(rel));
     let entries = match entries {

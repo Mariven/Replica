@@ -1,4 +1,4 @@
-//! Shell commands the daemon runs, either on its own events (actions) or on content in transit (transforms). Each command gets `${name}` templating and a timeout, with its output captured for the event that reports the run.
+//! Shell commands run by the daemon. Actions run in response to events, and transforms rewrite content on its way from one site to another. Each command can use `${name}` placeholders and has a timeout. Its output goes into the event that reports the run.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::event::Event;
 
-/// Default time a command may run before it is killed.
+/// The time a command may run before it is killed, if the configuration gives no timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A command as configured: its text with `${name}` placeholders and its timeout.
@@ -30,12 +30,12 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// True when the command exited with status zero in time.
+    /// True if the command exited with status zero before the timeout.
     pub fn ok(&self) -> bool {
         self.status == Some(0) && !self.timed_out
     }
 
-    /// One line summarizing the outcome for an event.
+    /// A one-line description for an event: the exit status or the timeout, then the last line of output.
     pub fn summary(&self) -> String {
         let how = if self.timed_out { "timed out".to_owned() } else { format!("exit {}", self.status.map(|s| s.to_string()).unwrap_or_else(|| "signal".into())) };
         let tail = self.output.trim();
@@ -43,7 +43,7 @@ impl Outcome {
     }
 }
 
-/// Replace `${name}` with its value for each name in the map, leaving unknown placeholders as written.
+/// Replace each `${name}` with its value from the map. A placeholder whose name is not in the map stays as written.
 pub fn expand(template: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -69,7 +69,7 @@ pub fn expand(template: &str, vars: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Run a command through `sh -c` in a directory with extra environment, killing it after the timeout.
+/// Run a command through `sh -c` in `cwd`, with `env` added to its environment. The command is killed if it runs past its timeout.
 pub fn run(shell: &Shell, cwd: &Path, env: &BTreeMap<String, String>) -> Result<Outcome> {
     let mut child = Command::new("sh")
         .arg("-c")
@@ -81,7 +81,7 @@ pub fn run(shell: &Shell, cwd: &Path, env: &BTreeMap<String, String>) -> Result<
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("starting `{}`", shell.text))?;
-    // Separate threads drain both pipes, so a chatty command keeps running instead of stalling on a full pipe while the parent waits for it.
+    // Read both pipes on separate threads, so a command with a lot of output cannot fill a pipe and block while the loop below waits for it to exit.
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let out = std::thread::spawn(move || { let mut s = String::new(); let _ = stdout.read_to_string(&mut s); s });
@@ -105,22 +105,23 @@ pub fn run(shell: &Shell, cwd: &Path, env: &BTreeMap<String, String>) -> Result<
     Ok(Outcome { status, timed_out, output })
 }
 
-/// The events a relation may react to.
+/// The events a relation can run an action on, named by the keys under `on`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Trigger {
-    /// Once per cycle in which at least one plan of the relation applied.
+    /// Once per cycle in which the relation applied at least one operation.
     Changed,
-    /// Once per key whose plan applied.
+    /// Once per applied operation.
     Resolved,
-    /// Once per key held by a gate, when the hold appears or changes.
+    /// When a closed gate holds a key's plan, and again if the plan changes.
     Held,
-    /// Once per key held by a conflict or an unreadable peer, when it appears or changes.
+    /// When replicas of a key are held because of a conflict or an unreadable file, and again if the reasons change.
     Conflict,
+    /// When deciding or applying a key fails, and again if the error changes.
     Error,
 }
 
 impl Trigger {
-    /// Parse the configuration key.
+    /// The trigger for a key under `on`, or None if the key is not a trigger name.
     pub fn parse(word: &str) -> Option<Trigger> {
         match word {
             "changed" => Some(Trigger::Changed),
@@ -132,7 +133,7 @@ impl Trigger {
         }
     }
 
-    /// The configuration word for the trigger.
+    /// The trigger's key under `on`, which the command also gets as `REPLICA_EVENT`.
     pub fn word(self) -> &'static str {
         match self {
             Trigger::Changed => "changed",
@@ -143,7 +144,7 @@ impl Trigger {
         }
     }
 
-    /// The trigger an event fires, if any. The engine fires `Changed` itself once per cycle, since no single event corresponds to it.
+    /// The trigger for an event, if any. No single event corresponds to `Changed`, so the engine fires it on its own once per cycle.
     pub fn of(event: &Event) -> Option<Trigger> {
         match event {
             Event::Resolved { ops, .. } if *ops > 0 => Some(Trigger::Resolved),
@@ -155,19 +156,19 @@ impl Trigger {
     }
 }
 
-/// The actions of a relation.
+/// A relation's actions, from its `on` block.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Actions {
     pub on: BTreeMap<Trigger, Shell>,
 }
 
 impl Actions {
-    /// True when no action is configured.
+    /// True if the relation has no actions.
     pub fn is_empty(&self) -> bool {
         self.on.is_empty()
     }
 
-    /// Run the action for a trigger with the variables of the event, returning the event describing the run.
+    /// Run the action for a trigger and return an event describing the run, or None if the trigger has no action. The variables fill the command's placeholders and also go into its environment as `REPLICA_<NAME>`.
     pub fn fire(&self, trigger: Trigger, relation: &str, vars: &BTreeMap<String, String>, cwd: &Path) -> Option<Event> {
         let shell = self.on.get(&trigger)?;
         let text = expand(&shell.text, vars);
@@ -181,7 +182,7 @@ impl Actions {
     }
 }
 
-/// Run a transform. The command receives `${in}` and `${out}`. To succeed it has to write the output file and exit zero before the timeout.
+/// Run a transform command on `input`, writing to `output`. The command gets the two paths as `${in}` and `${out}`, and as `REPLICA_IN` and `REPLICA_OUT`. The transform succeeds if the command exits zero before its timeout and the output file exists.
 pub fn transform(shell: &Shell, input: &Path, output: &Path, cwd: &Path) -> Result<()> {
     let vars: BTreeMap<String, String> = [("in".to_owned(), input.display().to_string()), ("out".to_owned(), output.display().to_string())].into_iter().collect();
     let text = expand(&shell.text, &vars);

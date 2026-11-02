@@ -1,6 +1,6 @@
-//! The loopback dashboard: a small HTTP server answering pages, `status.json`, history, blob downloads, and control posts.
+//! The dashboard, a small HTTP server on loopback for the status pages, `status.json`, history, blob downloads, and the control posts.
 //!
-//! A page reads live state whenever the engine is idle. While a cycle holds the engine, the page falls back to the report published after the previous cycle and says so.
+//! If the engine is idle, a page shows its current state. While a cycle is running, the page shows the report from the end of the previous cycle and says so.
 
 pub mod http;
 pub mod render;
@@ -33,11 +33,11 @@ pub enum Command {
     Pause,
     Resume,
     Stop,
-    /// Persist a gate change the dashboard has already applied to the shared flags.
+    /// Save a gate change to the database. The dashboard has already set the shared flag.
     Gate { relation: Option<String>, closed: bool },
 }
 
-/// Process telemetry shared between the main loop and the dashboard.
+/// Process state and counters, shared by the main loop and the dashboard.
 pub struct Runtime {
     pub pid: u32,
     pub version: &'static str,
@@ -52,18 +52,18 @@ pub struct Runtime {
     pub paused: AtomicBool,
     pub watching: AtomicBool,
     pub watched_roots: Mutex<Vec<PathBuf>>,
-    /// Relations in which the watcher has noticed a change. Once the debounce period passes, the main loop empties this set and runs an early cycle over those relations.
+    /// Relations with a change reported by the watcher. After the debounce period, the main loop empties this set and runs a cycle over those relations ahead of schedule.
     pub dirty: Mutex<BTreeSet<String>>,
-    /// Intent rows found and cleared at startup, shown for the life of the process.
+    /// Intent rows found and cleared at startup. The dashboard shows them until the process exits.
     pub cleared_intents: Mutex<Vec<Intent>>,
-    /// Report published after each cycle, served while a cycle holds the engine.
+    /// The snapshot taken at the end of the last cycle. Pages show it while a cycle is running.
     pub snapshot: Mutex<Option<Arc<Snapshot>>>,
     pub commands: Sender<Command>,
     /// Exit status once STOP is set: 0 for halt, 1 for restart so launchd relaunches.
     pub exit_code: std::sync::atomic::AtomicI32,
 }
 
-/// Everything a page reads from the engine, all taken at the same moment.
+/// The engine state that a page shows, read at a single moment.
 pub struct Snapshot {
     pub at: SystemTime,
     pub report: Report,
@@ -72,7 +72,7 @@ pub struct Snapshot {
     pub blob_stats: Result<(u64, u64), String>,
 }
 
-/// Read a report plus store statistics from the engine.
+/// Read the report and the database and archive statistics from the engine.
 pub fn take_snapshot(eng: &Engine) -> Snapshot {
     Snapshot {
         at: SystemTime::now(),
@@ -83,20 +83,20 @@ pub fn take_snapshot(eng: &Engine) -> Snapshot {
     }
 }
 
-/// Everything a request handler needs.
+/// The shared state that request handlers use.
 pub struct Dashboard {
     pub engine: Arc<Mutex<Engine>>,
-    /// The engine's gate flags, shared so a gate request takes effect at once even while a cycle holds the engine.
+    /// The engine's gate flags. They are shared so that a gate request takes effect even while a cycle is running.
     pub gates: Arc<Gates>,
     pub events: Arc<Mutex<VecDeque<Stamped>>>,
     pub rt: Arc<Runtime>,
     pub config: DashboardConfig,
     pub blobs: Blobs,
-    /// Check before a restart that the configuration still loads. On an error the dashboard refuses the restart and keeps the current process running.
+    /// Check that the configuration still loads before a restart. If it fails to load, the dashboard refuses the restart and the daemon keeps running.
     pub revalidate: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
-/// A fresh snapshot when the engine is idle; otherwise the one published after the last cycle, marked stale.
+/// Take a fresh snapshot if the engine is idle. While a cycle is running, return the snapshot from the end of the last cycle instead and mark it stale.
 fn current_snapshot(ctx: &Dashboard) -> (Arc<Snapshot>, bool) {
     match ctx.engine.try_lock() {
         Ok(eng) => {
@@ -105,7 +105,7 @@ fn current_snapshot(ctx: &Dashboard) -> (Arc<Snapshot>, bool) {
             (snap, false)
         }
         Err(std::sync::TryLockError::WouldBlock) => {
-            // The main loop takes the snapshot lock while it already holds the engine, the opposite of the order here. To avoid a deadlock with it, this thread drops the snapshot guard before it blocks on the engine below.
+            // The main loop locks the engine and then the snapshot. To avoid a deadlock, this thread releases the snapshot lock before it waits for the engine.
             let published = ctx.rt.snapshot.lock().unwrap().clone();
             match published {
                 Some(snap) => (snap, true),
@@ -119,7 +119,7 @@ fn current_snapshot(ctx: &Dashboard) -> (Arc<Snapshot>, bool) {
     }
 }
 
-/// Listen on the loopback interface, one thread per connection.
+/// Listen on the loopback interface and answer each connection on its own thread.
 pub fn serve(ctx: Arc<Dashboard>) {
     std::thread::spawn(move || {
         let listener = match TcpListener::bind(("127.0.0.1", ctx.config.port)) {
@@ -139,13 +139,13 @@ pub fn serve(ctx: Arc<Dashboard>) {
     });
 }
 
-/// A blob to stream instead of a buffered response.
+/// A blob download, streamed from disk instead of buffered like other responses.
 struct Blob {
     path: PathBuf,
     name: String,
 }
 
-/// Answer a connection.
+/// Read a request from the connection and write the response.
 fn handle(mut stream: TcpStream, ctx: &Dashboard) {
     let Some(req) = Request::read(&mut stream) else {
         Response::text("400 Bad Request", "bad request").write(&mut stream);
@@ -157,7 +157,7 @@ fn handle(mut stream: TcpStream, ctx: &Dashboard) {
     }
 }
 
-/// Stream a blob as a download, since a revision can be as large as the largest synced file.
+/// Send a blob as a download. It is streamed because an archived revision can be as large as any synced file.
 fn stream_blob(stream: &mut TcpStream, path: &Path, name: &str) {
     match fs::File::open(path).and_then(|f| f.metadata().map(|m| (f, m.len()))) {
         Ok((mut f, len)) => {
@@ -169,7 +169,7 @@ fn stream_blob(stream: &mut TcpStream, path: &Path, name: &str) {
     }
 }
 
-/// Translate the gate `to` parameter.
+/// Convert the `to` parameter of `/gate` to a closed flag: true for `closed`, false for `open`, and None for anything else.
 fn gate_target(to: Option<&str>) -> Option<bool> {
     match to {
         Some("open") => Some(false),
@@ -178,7 +178,7 @@ fn gate_target(to: Option<&str>) -> Option<bool> {
     }
 }
 
-/// Route a request to its handler.
+/// Build the response to a request. A blob download comes back as `Err` so the caller can stream it.
 fn route(req: &Request, ctx: &Dashboard) -> Result<Response, Blob> {
     let rt = &ctx.rt;
     let method = req.method.as_str();
@@ -204,7 +204,7 @@ fn route(req: &Request, ctx: &Dashboard) -> Result<Response, Blob> {
                 return Ok(Response::text("400 Bad Request", "gate needs to=open or to=closed"));
             };
             let word = if closed { "closed" } else { "opened" };
-            // The flag changes at once, so a running cycle honors it at its next key; the main loop persists it when it next holds the engine.
+            // The shared flag changes at once, so a running cycle obeys it from its next relation on. The main loop saves it to the database when it next holds the engine.
             let relation = req.param("rel");
             match &relation {
                 Some(rel) => {
@@ -290,7 +290,7 @@ pub fn tilde(p: &Path) -> String {
     tilde_str(&p.display().to_string())
 }
 
-/// Display a path string with `$HOME` replaced by `~`, matching whole components so `/Users/home2` stays as it is.
+/// Display a path string with `$HOME` replaced by `~`. Only whole components match, so `/Users/home2` is left alone.
 pub fn tilde_str(s: &str) -> String {
     match std::env::var("HOME") {
         Ok(h) if !h.is_empty() => match Path::new(s).strip_prefix(&h) {
@@ -302,7 +302,7 @@ pub fn tilde_str(s: &str) -> String {
     }
 }
 
-/// `1 file`, `2 files`.
+/// Format a count with its word, as in `1 file` or `2 files`.
 pub fn plural(n: usize, word: &str) -> String {
     if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
 }
@@ -317,7 +317,7 @@ pub fn fmt_stamp(t: SystemTime) -> String {
     DateTime::<Local>::from(t).format("%b %-d, %H:%M").to_string()
 }
 
-/// Compact duration: `2d 3h`, `4m 12s`, `800ms`.
+/// Format a duration in short form, as in `2d 3h`, `4m 12s`, or `800ms`.
 pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     let two = |big: u64, big_u: &str, small: u64, small_u: &str| if small > 0 { format!("{big}{big_u} {small}{small_u}") } else { format!("{big}{big_u}") };
@@ -342,7 +342,7 @@ pub fn fmt_ago(t: SystemTime) -> String {
     }
 }
 
-/// Human-readable byte count.
+/// Format a byte count in binary units, as in `512 B` or `1.5 KB`.
 pub fn fmt_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;

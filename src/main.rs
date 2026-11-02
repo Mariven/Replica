@@ -1,4 +1,4 @@
-//! The daemon. It loads the configuration, opens the state directory, serves the dashboard, then runs a cycle at each interval or sooner when the watcher reports a change. A signal or a dashboard command stops it cleanly.
+//! The program's entry point, which hands most subcommands to the cli module and runs the daemon itself. The daemon loads the configuration, opens the state folder, and serves the dashboard. It then runs a cycle at each interval, or sooner when the watcher reports a change, until a signal or a dashboard command stops it.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
@@ -27,7 +27,7 @@ extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-/// Stop cleanly on SIGTERM and SIGINT instead of dying mid-write.
+/// Catch SIGTERM and SIGINT, so the daemon finishes the key it is applying before it exits.
 fn install_signal_handlers() {
     let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     // SAFETY: the handler only stores an atomic, which is async-signal-safe. Passing a plain function pointer to signal() is its documented use.
@@ -133,14 +133,14 @@ fn build_hooks(loaded: &config::Loaded, runtime: &Arc<Runtime>, events: &Arc<Mut
     Ok(hooks)
 }
 
-/// The run subcommand.
+/// The run subcommand: start the daemon and run cycles until it stops. With --once it runs a single cycle and returns 1 if that cycle had errors.
 fn run_daemon(config_path: &Path, once: bool, gate_flag: bool) -> Result<i32> {
     let (loaded, problems) = cli::load_checked(config_path)?;
     let state = loaded.settings.state.clone().context("the config needs a top-level state directory to run")?;
     fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
     install_signal_handlers();
 
-    // Lock the state directory so only a single daemon runs against this journal.
+    // Lock the state folder so that a second daemon cannot run against the same database.
     let lock_path = state.join("replica.lock");
     let lock = fs::File::create(&lock_path).with_context(|| format!("creating {}", lock_path.display()))?;
     if let Err(e) = lock.try_lock() {

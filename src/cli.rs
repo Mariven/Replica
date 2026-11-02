@@ -1,4 +1,4 @@
-//! The command line. This module parses the subcommands with their arguments and carries out all of them except run. Check, explain, plan, and forget read the configuration alone. Status, history, and the control commands talk to a running daemon over its dashboard port.
+//! The command line. This module parses the subcommands with their arguments and carries out all of them except run. Check, explain, plan, and forget work without a running daemon. Status, history, and the control commands talk to the running daemon over its dashboard port.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -54,7 +54,7 @@ pub enum Port {
 }
 
 impl Port {
-    /// Resolve to a port number.
+    /// The port number. If a config path was given instead, the file is loaded and must set a dashboard port.
     pub fn resolve(&self) -> Result<u16> {
         match self {
             Port::Number(n) => Ok(*n),
@@ -169,7 +169,7 @@ pub fn load_checked(path: &Path) -> Result<(Loaded, Vec<String>)> {
     Ok((loaded, problems.into_iter().map(|p| p.message).collect()))
 }
 
-/// The check subcommand. Returns the exit status.
+/// The check subcommand. Prints each problem to standard error and returns exit status 1 if there were any, otherwise 0.
 pub fn check(path: &Path) -> Result<i32> {
     let (loaded, problems) = load_checked(path)?;
     for p in &problems {
@@ -196,7 +196,7 @@ fn select<'a>(loaded: &'a Loaded, relation: Option<&str>) -> Result<Vec<&'a engi
     }
 }
 
-/// The explain subcommand: print the resolved form of each relation, with its profiles, variables, patterns, replicas, and flow.
+/// The explain subcommand. Returns the text describing how each relation resolved, with its profiles, variables, patterns, replicas, and flow.
 pub fn explain(path: &Path, relation: Option<&str>) -> Result<String> {
     let loaded = config::load_file(path)?;
     let mut out = String::new();
@@ -274,7 +274,7 @@ pub fn explain(path: &Path, relation: Option<&str>) -> Result<String> {
     Ok(out)
 }
 
-/// Open the engine over the configured state directory without a lock, for read-only subcommands.
+/// Open an engine over the configured state folder for plan and forget. It does not take the daemon's lock.
 fn open_engine(loaded: Loaded) -> Result<Engine> {
     let state = loaded.settings.state.clone().context("the config needs a top-level state directory")?;
     let store = Store::open(&state.join("state.db"))?;
@@ -284,7 +284,7 @@ fn open_engine(loaded: Loaded) -> Result<Engine> {
     Ok(eng)
 }
 
-/// The plan subcommand: print the pending operations of each relation, read from the engine's report, without applying any of them.
+/// The plan subcommand. Returns the text listing the pending operations of each relation, taken from the engine's report. Nothing is applied.
 pub fn plan(path: &Path, relation: Option<&str>) -> Result<String> {
     let loaded = config::load_file(path)?;
     let only: Option<BTreeSet<String>> = relation.map(|r| BTreeSet::from([r.to_owned()]));
@@ -348,7 +348,7 @@ fn request(port: u16, method: &str, path: &str) -> Result<(u16, String)> {
     Ok((status, body.to_owned()))
 }
 
-/// Post a control action.
+/// Post to a control route such as /pause, and fail if the daemon refuses it.
 pub fn control(port: &Port, path: &str) -> Result<String> {
     let port = port.resolve()?;
     let (status, body) = request(port, "POST", path)?;
@@ -368,7 +368,7 @@ pub fn status(port: &Port, json: bool) -> Result<String> {
     if json {
         return Ok(body);
     }
-    // Pull the fields out by string search instead of with a JSON library, since the document is flat and its field names are known.
+    // Read the fields by string search. Their names are known and their values are plain, so a JSON parser is not needed.
     let field = |name: &str| -> String {
         let needle = format!("\"{name}\":");
         body.find(&needle).map(|i| {
@@ -389,7 +389,7 @@ pub fn status(port: &Port, json: bool) -> Result<String> {
     Ok(out)
 }
 
-/// Fetch the history of a relation.
+/// Fetch the archived revisions of a relation, raw with --json or as a line per revision.
 pub fn history(port: &Port, relation: &str, json: bool) -> Result<String> {
     let port = port.resolve()?;
     let path = format!("/history?rel={}&json=1", crate::dashboard::http::url_encode(relation));

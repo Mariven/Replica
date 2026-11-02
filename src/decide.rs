@@ -1,8 +1,8 @@
-//! Decide the desired state of each replica of a key, given the transitions of all its replicas and the policy of the relation.
+//! The decision for a key: what each of its replicas should hold, given their transitions and the relation's policy.
 //!
-//! The rules from docs/design.md each appear below as a small function under the same name: Voice, Admit, Hold, Contest, Stand, Conform, Resolve, Operation.
-//! The decision for a target replica depends only on the observations of the key, so the outcome is the same in whatever order the replicas are visited.
-//! The result is an assignment: for each replica, keep its content, take a content hash, or become absent. Replicas held back are listed with their reasons.
+//! Each rule in docs/design.md is marked below by its name, either on a function or on a comment inside `decide`: Voice, Admit, Hold, Contest, Stand, Conform, Resolve, Operation.
+//! A replica is decided from the bases and observations of the key alone, so replicas can be visited in any order.
+//! The result is an assignment, which says whether each replica keeps its current state, receives new content, or has its file deleted. Held replicas are listed with the reason.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use crate::flow::{Flow, Kind, Policy, Property, Rule};
 use crate::observe::{Basis, Hash, Observation, Snapshot, Transition, classify};
 
-/// The inputs about a replica of a key: its identity, its site, its path, the basis from the store, and the observation from this cycle.
+/// A replica of a key, with its recorded basis and what this cycle observed there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slot {
     pub id: String,
@@ -22,27 +22,27 @@ pub struct Slot {
 }
 
 impl Slot {
-    /// How the replica moved since its basis.
+    /// How the file changed since its basis was recorded.
     pub fn transition(&self) -> Transition {
         classify(&self.basis, &self.observation)
     }
 
-    /// The observed snapshot, when the file is present.
+    /// The observed snapshot, if the file is present.
     fn snapshot(&self) -> Option<&Snapshot> {
         self.observation.snapshot()
     }
 
-    /// True when the replica matches its recorded snapshot and the file is present: its content is the agreed baseline.
+    /// True if the file is present and still matches its recorded snapshot, so its content is the last synced version.
     fn settled(&self) -> bool {
         self.basis.snapshot().is_some() && self.transition() == Transition::Unchanged && self.snapshot().is_some()
     }
 
-    /// True when the cycle could not read the replica.
+    /// True if the cycle could not read the file.
     fn unreadable(&self) -> bool {
         matches!(self.observation, Observation::Unreadable(_))
     }
 
-    /// The file name, for the `name` property.
+    /// The file name, which the `name` resolver rule compares.
     fn file_name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
@@ -54,16 +54,16 @@ pub struct Situation {
     pub slots: Vec<Slot>,
 }
 
-/// A changed replica's request to its peers: take this content, or drop the file.
+/// A changed replica's request to its peers: take its content, or delete the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Proposal {
-    /// This content, as held by the replica `from`.
+    /// The content with this hash, as held by replica `from`.
     Content { from: String, hash: Hash },
     Absent,
 }
 
 impl Proposal {
-    /// The content hash, or None for absence. Candidates with equal values stand on the same side of a contest.
+    /// The content hash, or None for absence. Candidates with the same value are on the same side of a contest.
     fn value(&self) -> Option<Hash> {
         match self {
             Proposal::Content { hash, .. } => Some(*hash),
@@ -72,19 +72,19 @@ impl Proposal {
     }
 }
 
-/// The target state of a replica once the plan runs.
+/// The state a replica should be in after the plan runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Desired {
     Keep,
-    /// This hash, as proposed or held by the replica `from`. When times are synced, the write copies the modification time of `from` as well.
+    /// The content with this hash, taken from replica `from`. When `sync_times` is on, the write also copies the mtime of `from`.
     Content { from: String, hash: Hash },
     Absent,
 }
 
-/// A filesystem operation on a replica, implied by the plan.
+/// A write or delete that brings a replica to its desired state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
-    /// Write the content of this hash to the replica, taking the modification time from `from`.
+    /// Write the content with this hash to replica `to`. The mtime, if copied, comes from replica `from`.
     Write { to: String, hash: Hash, from: String },
     Delete { at: String },
 }
@@ -92,25 +92,25 @@ pub enum Op {
 /// The decision for a key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Assignment {
-    /// Desired state by replica id. Held replicas are absent from this map.
+    /// The desired state of each replica, by id. Held replicas are left out.
     pub desired: BTreeMap<String, Desired>,
-    /// Replicas held back, with the reason, in slot order.
+    /// The held replicas and the reason for each, in slot order.
     pub held: Vec<(String, String)>,
 }
 
 impl Assignment {
-    /// The operations needed to move each replica from its observed state to its desired one.
+    /// The writes and deletes that take each replica from what was observed to its desired state.
     pub fn ops(&self, situation: &Situation) -> Vec<Op> {
         situation.slots.iter().filter_map(|slot| operation(slot, self.desired.get(&slot.id)?)).collect()
     }
 
-    /// True when a replica is held.
+    /// True if the replica with this id is held.
     pub fn is_held(&self, id: &str) -> bool {
         self.held.iter().any(|(h, _)| h == id)
     }
 }
 
-/// Decide the assignment for a key under a policy.
+/// Decide what each replica of a key should hold under the relation's policy.
 pub fn decide(policy: &Policy, situation: &Situation) -> Assignment {
     let slots = &situation.slots;
     let established = slots.iter().any(|s| s.basis.is_recorded());
@@ -123,7 +123,7 @@ pub fn decide(policy: &Policy, situation: &Situation) -> Assignment {
             continue;
         }
         let own = proposals[ti].as_ref();
-        // Hold: when the flow carries the target's proposal toward an unreadable peer, the target waits. Its basis stays as it is, so the change is still pending once the peer is readable again.
+        // Hold: if the flow carries the target's proposal to an unreadable peer, the target is held as well. Its basis is left alone, so the change is still pending when the peer can be read again.
         if let Some(p) = own {
             if let Some(u) = unreadable.iter().find(|u| travels(&policy.flow, target, p, u)) {
                 out.held.push((target.id.clone(), format!("waiting on {}: unreadable", u.id)));
@@ -131,20 +131,21 @@ pub fn decide(policy: &Policy, situation: &Situation) -> Assignment {
             }
         }
         let peers = || slots.iter().zip(&proposals).filter(|(s, _)| s.id != target.id);
-        // Contest: gather proposals from readable peers. A proposal counts only when the flow carries it to the target.
+        // Contest: the candidates are the proposals of readable peers that the flow carries to the target.
         let mut candidates: Vec<(&Slot, Proposal)> = peers()
             .filter(|(s, _)| !s.unreadable())
             .filter_map(|(s, p)| p.as_ref().filter(|p| travels(&policy.flow, s, p, target)).map(|p| (s, p.clone())))
             .collect();
         if !candidates.is_empty() {
-            // The target's own proposal joins the contest only when the flow carries it back to at least one challenger.
+            // The target's own proposal joins them if the flow carries it back to one of those peers.
             if let Some(p) = own {
                 if candidates.iter().any(|(c, _)| travels(&policy.flow, target, p, c)) {
                     candidates.push((target, p.clone()));
                 }
             }
         } else {
-            // Stand: when the flow carries the target's proposal to some peer, the target keeps its state. Conform: with no such proposal, settled peers supply the content.
+            // Stand: if the flow carries the target's proposal to some peer, the target keeps its state.
+            // Conform: otherwise the candidates are the settled peers whose content the flow carries to the target.
             let heard = own.is_some_and(|p| peers().any(|(s, _)| travels(&policy.flow, target, p, s)));
             if !heard {
                 candidates = peers()
@@ -169,7 +170,7 @@ pub fn decide(policy: &Policy, situation: &Situation) -> Assignment {
     out
 }
 
-/// Voice: derive a proposal from the replica's transition. A newcomer with no record makes no proposal when some peer already has a basis; it conforms instead.
+/// Voice: the proposal a replica makes from its transition. A replica where a file appeared proposes its content only if no replica of the key has a record yet. Otherwise it conforms to its peers.
 fn voice(slot: &Slot, established: bool) -> Option<Proposal> {
     let content = || slot.snapshot().map(|s| Proposal::Content { from: slot.id.clone(), hash: s.hash });
     match slot.transition() {
@@ -180,7 +181,7 @@ fn voice(slot: &Slot, established: bool) -> Option<Proposal> {
     }
 }
 
-/// Admit: the kinds of edge along which a proposal may travel to a target, given the target's observed state. An unreadable target admits the kinds for both a present and a missing file, since its state is unknown.
+/// Admit: the edge kinds along which a proposal can reach a target, given what was observed at the target. An unreadable target admits the kinds for a present file and for a missing one, since it is unknown whether the file exists.
 fn admitting(proposal: &Proposal, target: &Observation) -> &'static [Kind] {
     match (proposal, target) {
         (Proposal::Content { .. }, Observation::Present(_)) => &[Kind::Edit],
@@ -191,12 +192,12 @@ fn admitting(proposal: &Proposal, target: &Observation) -> &'static [Kind] {
     }
 }
 
-/// True when the flow carries the proposal from one slot's site to another's along an admitted kind.
+/// True if the flow carries the proposal from the site of `from` to the site of `to` along an edge of an admitted kind.
 fn travels(flow: &Flow, from: &Slot, proposal: &Proposal, to: &Slot) -> bool {
     admitting(proposal, &to.observation).iter().any(|k| flow.carries(*k, &from.site, &to.site))
 }
 
-/// Resolve: candidates with equal values stand together. A candidate wins by beating all candidates of other values under the rules. With no such candidate, the contest stays unresolved and the target is held.
+/// Resolve: if the candidates all have the same value, the target takes it. Otherwise a candidate wins if it beats each candidate with a different value under the rules. If none does, the result is a conflict and the target is held.
 fn resolve(rules: &[Rule], candidates: &[(&Slot, Proposal)]) -> Result<Proposal, String> {
     let distinct: BTreeSet<Option<Hash>> = candidates.iter().map(|(_, p)| p.value()).collect();
     if distinct.len() == 1 {
@@ -212,7 +213,7 @@ fn resolve(rules: &[Rule], candidates: &[(&Slot, Proposal)]) -> Result<Proposal,
     Err(format!("conflict: {} (no rule decides)", names.join(" vs ")))
 }
 
-/// Try the rules in order until one decides between the two slots. A property tie passes to the next rule. When the rules run out, `w` does not beat `o`.
+/// True if `w` beats `o` under the first rule that decides between them. If the files tie on a property, that rule is skipped. If no rule decides, `w` does not beat `o`.
 fn beats(rules: &[Rule], w: &Slot, o: &Slot) -> bool {
     for rule in rules {
         match rule {
@@ -240,7 +241,7 @@ fn beats(rules: &[Rule], w: &Slot, o: &Slot) -> bool {
     false
 }
 
-/// Compare two slots by a property. A present file beats an absence. On a tie this returns None so the caller can move to the next rule.
+/// Whether `w` beats `o` on a property, or None on a tie so the caller can try the next rule. A present file beats a missing one.
 fn property_beats(by: Property, w: &Slot, o: &Slot) -> Option<bool> {
     let order = match (w.snapshot(), o.snapshot()) {
         (Some(ws), Some(os)) => match by {
@@ -259,7 +260,7 @@ fn property_beats(by: Property, w: &Slot, o: &Slot) -> Option<bool> {
     }
 }
 
-/// Operation: the write or delete needed to bring a slot to its desired state, or None when it is already there.
+/// Operation: the write or delete that brings a replica to its desired state, or None if it is already there.
 fn operation(slot: &Slot, desired: &Desired) -> Option<Op> {
     match (desired, &slot.observation) {
         (Desired::Content { from, hash }, Observation::Present(snap)) => (snap.hash != *hash).then(|| Op::Write { to: slot.id.clone(), hash: *hash, from: from.clone() }),
@@ -269,7 +270,7 @@ fn operation(slot: &Slot, desired: &Desired) -> Option<Op> {
     }
 }
 
-/// Describe operations by replica id, as the intent journal records them.
+/// The operations as text with replica ids, in the form the intent row stores.
 pub fn describe_ops(ops: &[Op]) -> String {
     ops.iter().map(|op| match op {
         Op::Write { to, hash, from } => format!("write {to} <- {from} ({})", crate::observe::short_hash(hash)),
@@ -277,7 +278,7 @@ pub fn describe_ops(ops: &[Op]) -> String {
     }).collect::<Vec<_>>().join("; ")
 }
 
-/// Phrase a plan with display names, grouping writes by source: `copy source -> dest (a), dest (b); delete at dest (c)`.
+/// The plan as text with display names and with writes grouped by source, as in `copy source -> dest (a), dest (b); delete at dest (c)`.
 pub fn describe_plan(names: &BTreeMap<&str, &str>, ops: &[Op]) -> String {
     let name = |id: &str| names.get(id).map(|n| (*n).to_owned()).unwrap_or_else(|| id.to_owned());
     let mut copies: Vec<(String, Vec<String>)> = Vec::new();
@@ -339,7 +340,7 @@ mod tests {
         Op::Delete { at: at.into() }
     }
 
-    /// Operations and held ids of a decision.
+    /// Decide a key and return its operations and the ids of the held replicas.
     fn run(p: &Policy, s: &Situation) -> (Vec<Op>, Vec<String>) {
         let a = decide(p, s);
         (a.ops(s), a.held.iter().map(|(id, _)| id.clone()).collect())
@@ -351,7 +352,7 @@ mod tests {
             slot("a", "a", rec(1, 100), present(2, 200)),
             slot("b", "b", rec(1, 100), present(3, 300)),
         ]);
-        // Both files have size 1, so size ties and mtime decides for b.
+        // Both files have size 1, so the size rule ties and mtime picks b.
         assert_eq!(run(&policy("a <-> b [edit]", "size; mtime"), &s).0, vec![copy("b", "a", 3)]);
         assert_eq!(run(&policy("a <-> b [edit]", "size; a > b"), &s).0, vec![copy("a", "b", 2)]);
         assert_eq!(run(&policy("a <-> b [edit]", "size"), &s).1, vec!["a", "b"]);
@@ -367,18 +368,18 @@ mod tests {
         let a = decide(&policy("a -> {b, c} [edit]", ""), &s);
         assert_eq!(a.ops(&s), vec![copy("a", "c", 2)]);
         assert_eq!(a.held, vec![("a".to_string(), "waiting on b: unreadable".to_string()), ("b".to_string(), "unreadable: is a directory".to_string())]);
-        // With only a one-way edge from c to a, the flow has no path from a to b, so a is free to proceed and c overwrites its stray edit.
+        // Here the only edge runs from c to a. Since a's edit cannot reach b, a is not held. Instead c overwrites the edit.
         let a = decide(&policy("c -> a [edit]", ""), &s);
         assert_eq!(a.ops(&s), vec![copy("c", "a", 1)]);
         assert_eq!(a.held, vec![("b".to_string(), "unreadable: is a directory".to_string())]);
-        // An unreadable slot contributes no content. A settled slot has no proposal, so nothing waits on the unreadable peer.
+        // b is unreadable, so it offers no content. a is settled and makes no proposal, so a is not held either.
         let a = decide(&policy("a <-> b [edit]", ""), &sit(vec![
             slot("a", "a", rec(1, 100), present(1, 100)),
             slot("b", "b", rec(1, 100), Observation::Unreadable("denied".into())),
         ]));
         assert!(a.ops(&sit(vec![])).is_empty());
         assert_eq!(a.held, vec![("b".to_string(), "unreadable: denied".to_string())]);
-        // A deletion waits in the same way when a delete edge leads to the unreadable peer.
+        // A deletion at a is held the same way when a delete edge leads to the unreadable peer.
         let a = decide(&policy("a <-> b [edit]; a -> b [delete]", ""), &sit(vec![
             slot("a", "a", rec(1, 100), Observation::Missing),
             slot("b", "b", rec(1, 100), Observation::Unreadable("denied".into())),

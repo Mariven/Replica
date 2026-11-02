@@ -1,10 +1,10 @@
-//! A small HTTP/1.1 layer for the loopback dashboard. It parses request heads, writes responses, checks the Host and Origin headers against loopback, decodes and encodes URL values, escapes HTML, and quotes JSON strings.
+//! Enough HTTP/1.1 for the loopback dashboard: request parsing and responses, the loopback checks on Host and Origin, and escaping for URLs, HTML, and JSON.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-/// Longest request head accepted.
+/// Request heads are cut off at this many bytes.
 const MAX_HEAD: usize = 16 * 1024;
 
 /// A parsed request line and headers.
@@ -33,7 +33,7 @@ impl Request {
         Some(Request { method, path, query, headers })
     }
 
-    /// Read a request head from the stream. The whole head has to arrive within five seconds, however slowly the bytes trickle in.
+    /// Read a request head from the stream. The client has five seconds in total to send the whole head, however slowly it sends.
     pub fn read(stream: &mut TcpStream) -> Option<Request> {
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -63,7 +63,7 @@ impl Request {
         self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
-    /// A decoded query parameter.
+    /// The decoded value of a query parameter, or None if the query lacks it.
     pub fn param(&self, key: &str) -> Option<String> {
         self.query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=')?;
@@ -97,7 +97,7 @@ impl Response {
         Response::new(status, "text/plain; charset=utf-8", body.into())
     }
 
-    /// A 303 back to the main page. The control endpoints answer with this after they act.
+    /// A 303 redirect to the main page, sent by the control routes after they act.
     pub fn redirect_home() -> Response {
         let mut r = Response::new("303 See Other", "text/plain", "");
         r.extra.push("Location: /".into());
@@ -114,7 +114,7 @@ impl Response {
         r
     }
 
-    /// Write the response and close.
+    /// Write the response with `Connection: close`, since the server answers a single request per connection.
     pub fn write(&self, stream: &mut TcpStream) {
         let mut head = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n", self.status, self.content_type, self.body.len());
         for h in &self.extra {
@@ -128,7 +128,7 @@ impl Response {
     }
 }
 
-/// True when the host is localhost or a loopback address, with or without a port.
+/// True if a Host value is `localhost`, `127.0.0.1`, or `::1`, with or without a port.
 pub fn is_loopback_host(host: &str) -> bool {
     let host = host.trim();
     let name = if let Some(rest) = host.strip_prefix('[') {
@@ -139,7 +139,7 @@ pub fn is_loopback_host(host: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Decide whether a POST may act. The Host has to be loopback, which rules out a DNS rebinding attack. When the browser sends an Origin, that Origin has to match this dashboard's own address and port. When the browser sends Sec-Fetch-Site, the request has to come from this page or straight from the address bar.
+/// Check that a POST comes from the dashboard itself. The Host must be loopback, to block DNS rebinding. If the browser sends an Origin, it must be a loopback address on the dashboard's port. If it sends Sec-Fetch-Site, the request must come from the dashboard page or straight from the address bar.
 pub fn post_allowed(req: &Request, port: u16) -> Result<(), String> {
     match req.header("host") {
         Some(h) if is_loopback_host(h) => {}
@@ -165,7 +165,7 @@ pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Decode a query string value. The loop runs over bytes rather than chars, so a stray `%` right before a multibyte character leaves that character whole.
+/// Decode a query value. The loop works on bytes instead of chars, so a stray `%` before a multibyte character leaves that character intact.
 pub fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());

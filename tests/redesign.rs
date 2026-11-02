@@ -1,13 +1,13 @@
-//! End-to-end scenarios for the second design. The first design had no way to express any of these:
-//!     - declared fan-out under a constraint
-//!     - named locations with stable identities
+//! End-to-end tests of these relation features, run over temporary folders:
+//!     - fanout under a constraint
+//!     - labeled locations that keep their ids when others are added
 //!     - a file recreated over a tombstone
 //!     - transforms along an edge
 //!     - actions on resolved keys and changed cycles
 //!     - relations stamped out with `each`
 //!     - a relocated replica
-//!     - a policy change forcing re-evaluation
-//!     - gates persisted across restarts
+//!     - settled keys decided again after a policy change
+//!     - gates that persist across restarts
 //!     - ignore lists
 
 use std::collections::BTreeSet;
@@ -31,7 +31,7 @@ fn engine_with_events(tmp: &TempDir, relations_yaml: &str) -> (Engine, Events) {
     engine_from(tmp, &format!("state: {}\nrelations:\n{relations_yaml}", tmp.path().join("state").display()))
 }
 
-/// Build an engine from a full configuration text and collect its events.
+/// Build an engine from a full configuration text, recording its events and applying the global `gate` setting.
 fn engine_from(tmp: &TempDir, yaml: &str) -> (Engine, Events) {
     let loaded = config::load(yaml, Path::new("/cfg/config.yaml")).unwrap();
     let state = loaded.settings.state.clone().unwrap();
@@ -56,13 +56,13 @@ fn engine(tmp: &TempDir, relations_yaml: &str) -> Engine {
     engine_with_events(tmp, relations_yaml).0
 }
 
-/// Write a file, creating its parents.
+/// Write a file, creating parent folders as needed.
 fn write(path: impl AsRef<Path>, content: &str) {
     fs::create_dir_all(path.as_ref().parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
 }
 
-/// Read a file as text, or None when it is missing.
+/// The text of a file, or None if it is missing.
 fn read(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok()
 }
@@ -108,7 +108,7 @@ fn named_locations_keep_their_identity_when_siblings_come_and_go() {
     assert_eq!(read(x.join("a.mdc")).unwrap(), "v1");
     assert_eq!(eng.store.replicas_with_records("rules").unwrap(), BTreeSet::from(["dest[x]".to_string(), "source".to_string()]));
 
-    // With a second location added, the records for x stay in place, so only y gets seeded from source.
+    // After location y is added, x keeps its records, so only y is filled from source.
     let two = format!("    rules:\n      sites:\n        source: {}/\n        dest: {{ x: {}/, y: {}/ }}\n      flow: \"source -> dest [edit create]\"\n", src.display(), x.display(), y.display());
     let (eng2, events) = engine_with_events(&tmp, &two);
     eng2.cycle(None).unwrap();
@@ -131,7 +131,7 @@ fn a_file_recreated_after_a_deletion_wins_over_the_old_copy() {
     fs::remove_file(a.join("f.txt")).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "old");
-    // The engine reads the recreated file as an edit at source, so the new content travels to dest.
+    // The recreated file counts as a change at source, so the new content travels to dest.
     write(a.join("f.txt"), "new");
     eng.cycle(None).unwrap();
     assert_eq!(read(a.join("f.txt")).unwrap(), "new");
@@ -176,7 +176,7 @@ fn actions_fire_once_per_resolved_key_and_once_per_changed_cycle() {
     let lines: Vec<String> = read(&log).unwrap().lines().map(str::to_owned).collect();
     assert_eq!(lines, vec!["resolved f.txt write dest", "resolved g.txt write dest", "changed g"]);
     assert_eq!(count(&events, "action g"), 3);
-    // A quiet cycle fires no actions.
+    // A cycle with no changes runs no actions.
     eng.cycle(None).unwrap();
     assert_eq!(read(&log).unwrap().lines().count(), 3);
 }
@@ -184,7 +184,7 @@ fn actions_fire_once_per_resolved_key_and_once_per_changed_cycle() {
 #[test]
 fn each_stamps_out_independent_relations_with_their_own_gates() {
     let tmp = TempDir::new().unwrap();
-    // Each stamped copy relates its own pair of folders, since the checker reports a folder shared by two relations as an overlap.
+    // Each copy gets its own pair of folders, because two relations that share a folder are reported as overlapping.
     for p in ["alpha", "beta"] {
         write(tmp.path().join(p).join("rules/x.mdc"), "v1");
     }
@@ -212,12 +212,12 @@ fn a_relocated_replica_starts_over_and_is_reported() {
     let pair = |dest: &PathBuf| format!("    g:\n      sites: {{ source: {}/, dest: {}/ }}\n      flow: \"source <-> dest [edit create]\"\n", a.display(), dest.display());
     let eng = engine(&tmp, &pair(&b));
     eng.cycle(None).unwrap();
-    // dest now points at c, with different content in it. The old records for dest no longer apply, so the engine treats this as dest's first run.
+    // dest now points at c, which holds different content. The pattern behind dest has changed, so its old records are dropped and dest starts fresh.
     write(c.join("f.txt"), "theirs");
     let (eng2, events) = engine_with_events(&tmp, &pair(&c));
     eng2.cycle(None).unwrap();
     assert_eq!(count(&events, "relocated g"), 1, "{:?}", events.lock().unwrap());
-    // A replica on its first run conforms to a peer with a recorded basis, so c takes the content at source.
+    // c has no records but source does, so the file at c counts as new and takes the content at source.
     assert_eq!(read(c.join("f.txt")).unwrap(), "v1");
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1", "the old location is left alone");
 }
@@ -231,7 +231,7 @@ fn a_policy_change_re_evaluates_settled_keys() {
     eng.cycle(None).unwrap();
     eng.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")), None, "no create edge, so nothing is copied");
-    // The create edge changes the policy fingerprint, so the engine evaluates the settled key again and copies the file over.
+    // The create edge changes the policy fingerprint, so the next cycle decides the settled key again and copies the file.
     let eng2 = engine(&tmp, &format!("    g:\n      sites: {{ source: {}/, dest: {}/ }}\n      flow: \"source <-> dest [edit create]\"\n", a.display(), b.display()));
     eng2.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");
@@ -253,7 +253,7 @@ fn gates_persist_across_restarts_and_the_config_can_insist_on_closed() {
     eng2.set_relation_gate("g", false);
     eng2.cycle(None).unwrap();
     assert_eq!(read(b.join("f.txt")).unwrap(), "v1");
-    // With gate: true in its config, a relation starts closed on each restart, whatever the dashboard set before.
+    // With `gate: true` in the configuration, the relation starts with its gate closed on each restart, whatever was set before.
     let gated = format!("    g:\n      sites: {{ source: {}/, dest: {}/ }}\n      flow: \"source -> dest [edit create]\"\n      gate: true\n", a.display(), b.display());
     let eng3 = engine(&tmp, &gated);
     assert!(eng3.gates.relation_flag("g"));
@@ -324,7 +324,7 @@ fn a_replica_discovered_under_a_closed_gate_is_filled_once_the_gate_opens() {
     ));
     eng.cycle(None).unwrap();
     assert_eq!(read(projects.join("alpha/docs/main.md")).unwrap(), "v1");
-    // A new project appears while the gate is closed: the plan is held, and the replica must still count as new afterwards.
+    // A new project appears while the gate is closed. Its plan is held, and beta must still count as new when the gate opens.
     eng.set_global_gate(true);
     fs::create_dir_all(projects.join("beta")).unwrap();
     eng.cycle(None).unwrap();

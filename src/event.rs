@@ -1,34 +1,35 @@
-//! Events the engine emits as it works. Hooks receive them: loggers, counters, the dashboard's activity list, and the actions.
+//! Events the engine reports as it works. Each event goes to the hooks, which write log lines, update the counters, and fill the dashboard's list of recent events.
 
 use std::time::SystemTime;
 
 /// Something that happened during a cycle, tied to a relation and, where it applies, to a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A plan was applied. `detail` describes the operations and `ops` counts them. `paths` lists the paths written or deleted, for actions to use.
+    /// A key's plan was applied. `detail` describes the operations, `ops` counts them, and `paths` lists the files written or deleted.
     Resolved { relation: String, key: String, ops: usize, detail: String, paths: Vec<String> },
-    /// A plan exists but a gate holds it.
+    /// The key has a plan, but a closed gate holds it back.
     Held { relation: String, key: String, detail: String },
-    /// A replica of the key is waiting, either because the rules leave its conflict undecided or because a peer is unreadable.
+    /// A replica of the key is held. `reason` says why: a conflict that no resolver rule decides, or an unreadable file.
     Skipped { relation: String, key: String, reason: String },
-    /// The relation waits as a whole, as when a root with records is missing.
+    /// The whole relation is waiting. `reason` says why, for example a missing folder for a replica that has records.
     Pending { relation: String, reason: String },
-    /// Something was skipped or degraded without failing the relation.
+    /// A problem that is reported but leaves the relation running, such as a failure during the key walk.
     Warned { relation: String, key: String, detail: String },
+    /// Deciding or applying a key failed. The key is empty if the relation failed as a whole.
     Errored { relation: String, key: String, error: String },
-    /// A journal row from a run that died mid-plan.
+    /// An intent row left by a process that died while applying a plan.
     StaleIntent { relation: String, key: String, detail: String },
-    /// A replica's pattern differs from the one its records were made under.
+    /// The pattern behind a replica's id has changed since its records were made.
     Relocated { relation: String, replica: String, from: String, to: String },
-    /// An action ran. `ok` is false when it exited nonzero or timed out.
+    /// An action ran. `ok` is false if the command failed to start, exited nonzero, or timed out.
     Action { relation: String, name: String, ok: bool, detail: String },
     /// The watcher reported a change under a relation's roots.
     Watched { relation: String, path: String },
-    /// A cycle finished over the listed relations.
+    /// A cycle over the listed relations finished.
     Cycle { relations: Vec<String>, ops: usize, errors: usize, millis: u128 },
 }
 
-/// Color of an event in logs and on the dashboard.
+/// The color an event gets in logs and on the dashboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Ok,
@@ -38,7 +39,7 @@ pub enum Tone {
 }
 
 impl Event {
-    /// The relation the event belongs to, empty for a whole-cycle event.
+    /// The event's relation, or an empty string for a cycle event.
     pub fn relation(&self) -> &str {
         match self {
             Event::Resolved { relation, .. } | Event::Held { relation, .. } | Event::Skipped { relation, .. } | Event::Pending { relation, .. }
@@ -48,7 +49,7 @@ impl Event {
         }
     }
 
-    /// The key the event concerns, empty for relation-level events.
+    /// The event's key, or an empty string if the event is about the relation as a whole.
     pub fn key(&self) -> &str {
         match self {
             Event::Resolved { key, .. } | Event::Held { key, .. } | Event::Skipped { key, .. } | Event::Warned { key, .. } | Event::Errored { key, .. } | Event::StaleIntent { key, .. } => key,
@@ -73,7 +74,7 @@ impl Event {
         }
     }
 
-    /// The display tone.
+    /// The tone used to color the event.
     pub fn tone(&self) -> Tone {
         match self {
             Event::Resolved { .. } => Tone::Ok,
@@ -84,7 +85,7 @@ impl Event {
         }
     }
 
-    /// The free text, without relation or key.
+    /// The event's message, without the relation or key.
     pub fn text(&self) -> String {
         match self {
             Event::Resolved { detail, .. } => format!("resolved: {detail}"),
@@ -102,10 +103,10 @@ impl Event {
     }
 }
 
-/// Callback receiving each event.
+/// A callback the engine calls with each event it emits.
 pub type Hook = Box<dyn Fn(&Event) + Send + Sync>;
 
-/// An event with the time it was emitted, as the dashboard keeps them.
+/// An event and the time it was emitted, as kept in the dashboard's list of recent events.
 #[derive(Clone, Debug)]
 pub struct Stamped {
     pub at: SystemTime,

@@ -1,4 +1,4 @@
-//! The configuration file as typed structures, before validation. Each struct here rejects unknown fields.
+//! Typed structures for the configuration file as written, before it is checked. Each struct rejects unknown fields.
 
 use std::collections::BTreeMap;
 
@@ -29,10 +29,10 @@ pub struct FileText {
     pub include: Vec<String>,
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
-    /// Profiles stay as raw YAML until a relation merges them in. Their field names are checked on their own first, so a typo inside a profile is reported against that profile.
+    /// Profiles stay as raw YAML until a relation merges them in. Their fields are checked separately beforehand, so a typo in a profile is reported against the profile.
     #[serde(default)]
     pub profiles: Mapping,
-    /// Relations also stay as raw YAML, since profiles and variables are merged in before the typed form is built.
+    /// Relations stay as raw YAML too, because their profiles and variables are merged in before the typed form is built.
     #[serde(default)]
     pub relations: Mapping,
 }
@@ -59,7 +59,7 @@ pub struct DashboardText {
 fn default_recent_events() -> usize { 200 }
 fn default_refresh() -> u64 { 10 }
 
-/// A relation after profiles are merged and variables expanded.
+/// A relation body after its profiles are merged in and its variables are expanded.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RelationText {
@@ -97,7 +97,7 @@ pub struct RelationText {
 
 fn default_true() -> bool { true }
 
-/// The fields allowed in a relation body. The profile check uses this list to report an unknown field inside a profile.
+/// The fields a relation body may have. Profiles are checked against this list too.
 pub const RELATION_FIELDS: [&str; 16] = ["profile", "vars", "each", "sites", "where", "fanout", "flow", "resolve", "ignore", "sync_times", "gate", "watch", "log", "on", "transform", "profiles"];
 
 /// A command, written either as a bare string or as a mapping with `run` and `timeout`.
@@ -123,7 +123,7 @@ impl<'de> Deserialize<'de> for CommandText {
     }
 }
 
-/// Accept a bare number as well as a string. With this, `interval: 0` is handed to the duration check and rejected there with a clear message, instead of failing earlier as a YAML type mismatch.
+/// Accept a bare number as well as a string, so `interval: 0` reaches the duration check and gets its clear error message instead of a YAML type error.
 pub fn string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     match Value::deserialize(d)? {
         Value::Null => Ok(None),
@@ -133,7 +133,7 @@ pub fn string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String
     }
 }
 
-/// Accept a string or a YAML null, so a statement field can be left blank.
+/// Accept a string or a YAML null, so `flow` or `resolve` can be left blank.
 pub fn string_or_null<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
@@ -151,7 +151,7 @@ pub fn yaml_kind(v: &Value) -> &'static str {
     }
 }
 
-/// Rename the `where` key to `where_` before deserializing, since `where` is a Rust keyword and the struct field carries the underscore.
+/// Rename the `where` key to `where_` before deserializing, to match the struct field. The field needs the underscore because `where` is a Rust keyword.
 pub fn rename_where(body: &mut Mapping) {
     if let Some(v) = body.remove(Value::String("where".into())) {
         body.insert(Value::String("where_".into()), v);

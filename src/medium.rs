@@ -1,7 +1,7 @@
-//! The medium. The engine lists, reads, writes, and removes files through this trait. The local filesystem is the only implementation so far; the trait exists so a remote one can be added later without changing the engine.
+//! File operations for the engine. The engine lists, reads, writes, and removes files through the `Medium` trait instead of calling the filesystem directly. `Local`, for the local filesystem, is the only implementation. The trait is there so that a remote one can be added without changing the engine.
 //!
-//! A write goes to a temporary sibling in the target directory, gets synced, then is renamed over the target, so after a crash the target is either the old file or the complete new one.
-//! A marker file goes beside each file about to be created or deleted. It carries a note for whoever finds it after a crash; directory walks skip it.
+//! A write goes to a temporary file in the target's directory, is synced, and is then renamed over the target. After a crash the target holds either the old file or the complete new one.
+//! Before a file is created or deleted, a marker file is placed beside it with a note for anyone who finds it after a crash. Directory walks skip markers.
 
 use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
@@ -10,11 +10,11 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-/// Suffix for the temporary sibling of a write.
+/// Suffix of the temporary file a write goes to before the rename.
 pub const TEMP_SUFFIX: &str = ".replica-write";
 /// Suffix of the marker placed beside a file during a create or delete.
 pub const MARKER_SUFFIX: &str = ".replica.tmp";
-/// The file name length limit on most filesystems, in bytes.
+/// The maximum file name length on most filesystems, in bytes.
 const NAME_MAX: usize = 255;
 
 /// The file type, as reported by a directory entry or a stat call.
@@ -22,7 +22,7 @@ const NAME_MAX: usize = 255;
 pub enum EntryKind {
     File,
     Dir,
-    /// Symbolic links, sockets, and devices. Walks skip them. A replica path of this kind counts as unreadable.
+    /// Symbolic links, sockets, devices, and anything else that is neither a file nor a directory. Walks skip these entries, but a replica path of this kind counts as unreadable.
     Other,
 }
 
@@ -39,31 +39,31 @@ pub struct Meta {
     pub kind: EntryKind,
     pub size: u64,
     pub mtime: SystemTime,
-    /// Permission bits masked to the rwx triplet.
+    /// The rwx permission bits for owner, group, and others.
     pub mode: u32,
 }
 
-/// The result of an atomic write: the modification time now on the file, plus a warning if a non-fatal step failed.
+/// The result of an atomic write: the file's new modification time, and a warning if a step failed without stopping the write.
 pub struct Written {
     pub mtime: SystemTime,
     pub warning: Option<String>,
 }
 
-/// File operations the engine needs.
+/// The file operations the engine uses.
 pub trait Medium: Send + Sync {
-    /// Entries of a directory. A missing directory is an empty listing; any other failure is an error.
+    /// Entries of a directory. A missing directory lists as empty, but any other failure is returned as an error.
     fn list(&self, dir: &Path) -> io::Result<Vec<Entry>>;
-    /// Metadata of a path, None when nothing is there.
+    /// Metadata of a path, or None if nothing is there.
     fn stat(&self, path: &Path) -> io::Result<Option<Meta>>;
     /// Open a file for reading.
     fn open(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
-    /// Write content atomically into place, creating parent directories as needed. The mode and mtime are applied when given.
+    /// Write content to a path atomically, creating parent directories as needed. If a mode or mtime is given, the new file gets it.
     fn write(&self, path: &Path, content: &mut dyn Read, mtime: Option<SystemTime>, mode: Option<u32>) -> Result<Written>;
-    /// Remove a file; a file already gone counts as removed.
+    /// Remove a file. If the file is already gone, the call succeeds.
     fn remove(&self, path: &Path) -> io::Result<()>;
     /// Write a small file in one call, for markers.
     fn put(&self, path: &Path, bytes: &[u8]) -> io::Result<()>;
-    /// Whether a path is a directory.
+    /// True if a path is a directory.
     fn is_dir(&self, path: &Path) -> bool {
         matches!(self.stat(path), Ok(Some(Meta { kind: EntryKind::Dir, .. })))
     }
@@ -73,13 +73,13 @@ pub trait Medium: Send + Sync {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Local;
 
-/// Permission bits masked to the classic rwx triplet.
+/// The rwx permission bits of a file, for owner, group, and others.
 fn mode_bits(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     meta.permissions().mode() & 0o777
 }
 
-/// Classify a file type.
+/// Map a standard library file type to an `EntryKind`.
 fn kind_of(ty: fs::FileType) -> EntryKind {
     if ty.is_file() { EntryKind::File } else if ty.is_dir() { EntryKind::Dir } else { EntryKind::Other }
 }
@@ -119,7 +119,7 @@ impl Medium for Local {
         let mut warning = None;
         let staged: Result<()> = (|| {
             let mut f = fs::File::create(&tmp).with_context(|| format!("creating temp file {}", tmp.display()))?;
-            // The permissions are set while the temp file is still empty, so content copied from a private donor is protected from the first byte on.
+            // The mode is set before any content is written, so a copy of a private file is protected from the first byte.
             if let Some(m) = mode {
                 use std::os::unix::fs::PermissionsExt;
                 if let Err(e) = f.set_permissions(fs::Permissions::from_mode(m)) {
@@ -138,7 +138,7 @@ impl Medium for Local {
             return Err(e);
         }
         fs::rename(&tmp, path).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
-        // The parent directory is synced so the rename survives a crash. Some filesystems refuse this sync; the content itself is already synced, so the refusal is ignored.
+        // The parent directory is synced so the rename survives a crash. Some filesystems refuse to sync a directory. That error is ignored, because the file content is already synced.
         if let Ok(d) = fs::File::open(parent) {
             let _ = d.sync_all();
         }
@@ -162,7 +162,7 @@ impl Medium for Local {
     }
 }
 
-/// Build the sibling name `<prefix><name><suffix>`. When that exceeds NAME_MAX, a short hash of the name stands in for the name itself.
+/// The name `<prefix><name><suffix>` for a file beside `path`. If that is longer than NAME_MAX, a 16-character hash of the name takes the place of the name.
 pub fn sibling_name(path: &Path, prefix: &str, suffix: &str) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
     if prefix.len() + name.len() + suffix.len() <= NAME_MAX {
@@ -172,12 +172,12 @@ pub fn sibling_name(path: &Path, prefix: &str, suffix: &str) -> String {
     }
 }
 
-/// The marker path for a target file.
+/// Path of the marker beside a target file.
 pub fn marker_path(target: &Path) -> PathBuf {
     target.parent().unwrap_or(Path::new("/")).join(sibling_name(target, "", MARKER_SUFFIX))
 }
 
-/// True for the daemon's own temporary and marker files, which walks skip.
+/// True for the daemon's own temporary and marker files, so that walks can skip them.
 pub fn is_own_file(name: &str) -> bool {
     name.ends_with(TEMP_SUFFIX) || name.ends_with(MARKER_SUFFIX)
 }

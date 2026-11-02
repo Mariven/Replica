@@ -1,4 +1,4 @@
-//! Load the configuration. The loader parses the YAML, merges in included files, assembles each relation from its profiles, expands variables, validates the result, then builds the relations for the engine.
+//! Load the configuration. The loader parses the YAML and merges in the included files. For each relation it then merges in the profiles, expands variables, checks the result, and builds the relation for the engine.
 //!
 //! ```yaml
 //! state: ~/scripts/replica/live
@@ -19,7 +19,7 @@
 //!         flow: "source -> dest [edit create]"
 //! ```
 //!
-//! Braced path variables such as `{project}` belong to patterns. Configuration variables are written `${name}` and are expanded before any pattern is parsed, which keeps the two kinds apart.
+//! Path variables in plain braces, such as `{project}`, belong to patterns. Configuration variables are written `${name}` and are expanded before any pattern is parsed, so the two kinds stay apart.
 
 pub mod merge;
 pub mod text;
@@ -38,13 +38,13 @@ use crate::pattern::{Constraint, Pattern};
 use crate::site::{Location, Site, compile_ignore, validate_vars};
 use text::{CommandText, DashboardText, FileText, RelationText, yaml_kind};
 
-/// Default archive cap.
+/// The archive cap used when the file sets none.
 const DEFAULT_ARCHIVE_CAP: &str = "100MB";
 
-/// Settings resolved from the file.
+/// The top-level settings of the file, with defaults filled in.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// The state directory, holding the database, the blob store, and the logs. It stays None when the file leaves it out, which `check` and `explain` tolerate.
+    /// The state folder, which holds the database, the blob store, and the logs. It is None if the file leaves it out, which is fine for `check` and `explain`.
     pub state: Option<PathBuf>,
     pub interval: Duration,
     pub watch: bool,
@@ -64,26 +64,26 @@ pub struct DashboardConfig {
 }
 
 impl Settings {
-    /// The database path, inside the state directory.
+    /// The database path, inside the state folder.
     pub fn db_path(&self) -> Option<PathBuf> {
         self.state.as_ref().map(|s| s.join("state.db"))
     }
 
-    /// The blob directory, inside the state directory.
+    /// The blob store folder, inside the state folder.
     pub fn blob_dir(&self) -> Option<PathBuf> {
         self.state.as_ref().map(|s| s.join("blobs"))
     }
 }
 
-/// The result of loading a configuration.
+/// A loaded configuration: the settings and the built relations.
 pub struct Loaded {
     pub settings: Settings,
     pub relations: Vec<Relation>,
-    /// Per relation, the profile chain and the expanded variables, kept so the explain command can show them.
+    /// The profiles and expanded variables of each relation, kept for `explain` to show.
     pub provenance: BTreeMap<String, Provenance>,
 }
 
-/// The profile chain and the expanded variables behind a relation.
+/// The profiles a relation lists by name, and the variables `explain` shows for it, with their expanded values.
 #[derive(Clone, Debug, Default)]
 pub struct Provenance {
     pub profiles: Vec<String>,
@@ -140,7 +140,7 @@ fn parse_file(yaml: &str, what: &Path) -> Result<FileText> {
     if yaml.trim().is_empty() {
         return Ok(FileText::default());
     }
-    // When the YAML goes straight into the struct, a type error reports the field path and position. Merge keys are not applied on that path, so a file using `<<` is parsed into a Value first.
+    // Serde reports the field path and position of a type error only when it reads the YAML straight into the struct, but it ignores merge keys when it does that. A file that uses `<<` is read into a Value first so its merge keys can be applied.
     if !yaml.contains("<<") {
         return serde_norway::from_str(yaml).with_context(|| format!("parsing {}", what.display()));
     }
@@ -155,7 +155,7 @@ pub fn load_file(path: &Path) -> Result<Loaded> {
     load(&yaml, path)
 }
 
-/// Load configuration text. Includes are resolved relative to `path`, which also appears in errors.
+/// Load configuration text read from `path`. Includes are resolved relative to its folder, and errors name it.
 pub fn load(yaml: &str, path: &Path) -> Result<Loaded> {
     let mut file = parse_file(yaml, path)?;
     let base = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
@@ -199,7 +199,7 @@ pub fn load(yaml: &str, path: &Path) -> Result<Loaded> {
     Ok(Loaded { settings, relations, provenance })
 }
 
-/// Refuse a profile with an unknown field. The typo is then reported against the profile itself, instead of against whichever relation happens to use it first.
+/// Fail if a profile has an unknown field. The check runs before any relation is built, so a typo is reported against the profile instead of against the first relation that uses it.
 fn check_profiles(profiles: &Mapping) -> Result<()> {
     for (k, v) in profiles {
         let name = k.as_str().with_context(|| format!("profile names must be strings, not {}", yaml_kind(k)))?;
@@ -212,10 +212,10 @@ fn check_profiles(profiles: &Mapping) -> Result<()> {
     Ok(())
 }
 
-/// Assemble a relation from its profiles, expand its variables, validate it, then build it.
+/// Merge a relation's profiles into its body, expand its variables, then check and build the relation. The profiles and variables are returned as well, for `explain`.
 fn build_relation(name: &str, body: &Mapping, profiles: &Mapping, scope: &BTreeMap<String, String>, each: &BTreeMap<String, String>, settings: &Settings) -> Result<(Relation, Provenance)> {
     let assembled = merge::assemble(body, profiles)?;
-    // The relation's own `vars` are read from the assembled body, so a profile may supply them. Their values may refer to variables from the outer scope.
+    // A relation's own `vars` come from the assembled body, so a profile can supply them. Their values may refer to variables from the outer scope.
     let mut vars = scope.clone();
     vars.insert("relation".into(), name.to_owned());
     vars.extend(each.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -247,7 +247,7 @@ fn build_relation(name: &str, body: &Mapping, profiles: &Mapping, scope: &BTreeM
     Ok((relation, prov))
 }
 
-/// Build the sites of a relation from its `sites` mapping. Each entry is a pattern, a list of patterns, or a map from location names to patterns.
+/// Build the sites of a relation from its `sites` mapping. Each entry is a pattern, a list of patterns, or a map from labels to patterns.
 fn build_sites(sites: &Mapping) -> Result<Vec<Site>> {
     let mut out = Vec::new();
     for (k, v) in sites {
@@ -290,7 +290,7 @@ fn build_sites(sites: &Mapping) -> Result<Vec<Site>> {
     Ok(out)
 }
 
-/// Apply the `where` block. Each entry adds a constraint to its variable on all of the patterns where that variable appears.
+/// Apply the `where` block. Each entry constrains its variable in each pattern that has that variable.
 fn apply_where(sites: &mut [Site], where_: &BTreeMap<String, Value>) -> Result<()> {
     for (var, spec) in where_ {
         let texts: Vec<String> = match spec {
@@ -317,7 +317,7 @@ fn apply_where(sites: &mut [Site], where_: &BTreeMap<String, Value>) -> Result<(
     Ok(())
 }
 
-/// Sort the variables into identity and fan-out sets according to the `fanout` declaration, reporting the misuses described in the design document.
+/// Split the variables into identity and fan-out sets. A variable on all sites is an identity variable. A variable on only some sites has to be listed under `fanout`. Anything else is an error, and the message suggests a fix.
 fn classify(sites: &[Site], declared: &[String]) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
     let per_site: Vec<(&str, BTreeSet<String>)> = sites.iter().map(|s| (s.name.as_str(), s.var_names())).collect();
     let all: BTreeSet<String> = per_site.iter().flat_map(|(_, v)| v.iter().cloned()).collect();
@@ -355,7 +355,7 @@ fn classify(sites: &[Site], declared: &[String]) -> Result<(BTreeSet<String>, BT
     Ok((identity, fanout))
 }
 
-/// Turn a command from `on` or `transform` into a shell with its timeout.
+/// Build the shell command for an `on` or `transform` entry, with its own timeout or the default.
 fn shell_of(cmd: &CommandText, what: &str) -> Result<Shell> {
     let timeout = match &cmd.timeout {
         Some(t) => parse_duration(t).with_context(|| format!("{what}: timeout"))?,
@@ -367,7 +367,7 @@ fn shell_of(cmd: &CommandText, what: &str) -> Result<Shell> {
     Ok(Shell { text: cmd.run.clone(), timeout })
 }
 
-/// Validate the expanded text of a relation and build it.
+/// Check the expanded text of a relation and build it.
 fn assemble_relation(name: &str, text: RelationText, settings: &Settings) -> Result<Relation> {
     let mut sites = build_sites(&text.sites)?;
     apply_where(&mut sites, &text.where_)?;
@@ -422,7 +422,7 @@ fn assemble_relation(name: &str, text: RelationText, settings: &Settings) -> Res
     })
 }
 
-/// The paths the daemon writes itself: the state directory (database and blob store) and each relation's log file. The caller refuses a site root that contains one of these or lies inside one.
+/// The paths the daemon writes to: the state folder and each relation's log file. A site root may not contain one of these or lie inside one.
 pub fn reserved_paths(settings: &Settings, relations: &[Relation]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = settings.state.iter().cloned().collect();
     out.extend(relations.iter().filter_map(|r| r.log.clone()));

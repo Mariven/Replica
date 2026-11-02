@@ -1,8 +1,8 @@
-//! The daemon's record of a file, the observation of the file as it now stands on disk, and the transition between the two.
+//! The database's record of a file, the file as a cycle finds it on disk, and the transition between the two.
 
 use std::time::SystemTime;
 
-/// Content hash as BLAKE3 bytes.
+/// The BLAKE3 hash of a file's content.
 pub type Hash = [u8; 32];
 
 /// The modification time, size, and content hash of a file at a single moment.
@@ -13,19 +13,19 @@ pub struct Snapshot {
     pub hash: Hash,
 }
 
-/// The store's record for a key at a replica.
+/// The database's record for a key at a replica.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Basis {
-    /// No record exists for the key at this replica.
+    /// The daemon has no record of the key at this replica.
     None,
-    /// The file is recorded as deleted here, either because the daemon found it gone or because the daemon deleted it.
+    /// The file is recorded as deleted here, because the daemon deleted it or found it missing after a sync.
     Tombstone,
-    /// The file as it stood after the last agreement.
+    /// The file as it was after the last sync.
     Snapshot(Snapshot),
 }
 
 impl Basis {
-    /// The recorded snapshot, when there is one.
+    /// The recorded snapshot, if there is one.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         match self {
             Basis::Snapshot(s) => Some(s),
@@ -33,7 +33,7 @@ impl Basis {
         }
     }
 
-    /// True for a tombstone or a snapshot: the daemon has recorded something here.
+    /// True if the daemon has a snapshot or a tombstone for this replica.
     pub fn is_recorded(&self) -> bool {
         !matches!(self, Basis::None)
     }
@@ -48,7 +48,7 @@ pub enum Observation {
 }
 
 impl Observation {
-    /// The observed snapshot, when the file is present.
+    /// The observed snapshot, if the file is present.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         match self {
             Observation::Present(s) => Some(s),
@@ -56,26 +56,26 @@ impl Observation {
         }
     }
 
-    /// The observed content hash, when the file is present.
+    /// The observed content hash, if the file is present.
     pub fn hash(&self) -> Option<Hash> {
         self.snapshot().map(|s| s.hash)
     }
 }
 
-/// The change at a replica from its basis to the current observation.
+/// How the file at a replica changed between its basis and this cycle's observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transition {
     Unchanged,
     Edited,
-    /// Present without any record. Such a replica conforms to any peer with a basis and otherwise proposes its own content.
+    /// The file is present but has no record. If another replica of the key has a record, this one conforms to its peers. Otherwise it proposes its own content.
     Appeared,
-    /// Present over a tombstone. Treated as an edit, since the deletion here was deliberate.
+    /// The file is present where a tombstone is recorded. It counts as an edit, since the file was deleted here and then put back.
     Recreated,
     Disappeared,
     Unreadable,
 }
 
-/// Classify the move from a basis to an observation.
+/// The transition from a recorded basis to what the cycle observed.
 pub fn classify(basis: &Basis, observation: &Observation) -> Transition {
     match (basis, observation) {
         (_, Observation::Unreadable(_)) => Transition::Unreadable,
@@ -88,17 +88,17 @@ pub fn classify(basis: &Basis, observation: &Observation) -> Transition {
     }
 }
 
-/// Render the first bytes of a hash as hex, for logs and the dashboard.
+/// The first four bytes of a hash in hex, for logs and the dashboard.
 pub fn short_hash(hash: &Hash) -> String {
     hash[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Render a whole hash as hex, as the blob store files are named.
+/// The full hash in hex, which is also the name of its file in the blob store.
 pub fn hex(hash: &Hash) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Parse a 64-character hex digest back into a hash.
+/// Parse a 64-character hex string into a hash, or return None if the text is not one.
 pub fn from_hex(text: &str) -> Option<Hash> {
     if text.len() != 64 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(classify(&Basis::Snapshot(snap(1)), &Observation::Missing), Transition::Disappeared);
         assert_eq!(classify(&Basis::Snapshot(snap(1)), &Observation::Present(snap(1))), Transition::Unchanged);
         assert_eq!(classify(&Basis::Snapshot(snap(1)), &Observation::Present(snap(2))), Transition::Edited);
-        // A read failure outranks any record.
+        // A file that cannot be read is Unreadable whatever its basis.
         assert_eq!(classify(&Basis::None, &Observation::Unreadable("denied".into())), Transition::Unreadable);
         assert_eq!(classify(&Basis::Snapshot(snap(1)), &Observation::Unreadable("denied".into())), Transition::Unreadable);
     }

@@ -1,6 +1,6 @@
-//! The flow and resolver of a relation. Flow statements draw arrows between sites and label each arrow with the kinds of transition passing along it. Resolver statements settle disagreements between sites.
+//! The flow and resolver of a relation. Flow statements are arrows between sites, each labeled with the kinds of change it carries. Resolver statements settle disagreements between sites.
 //!
-//! Semicolons separate flow statements. Each one joins a site, or a braced set of sites, to another by an arrow, with the carried kinds in brackets:
+//! Flow statements are separated by semicolons. Each one joins a site, or a set of sites in braces, to another by an arrow, and lists the kinds it carries in brackets:
 //!
 //! ```text
 //! source <-> dest [edit create]
@@ -9,7 +9,7 @@
 //! backup <- source
 //! ```
 //!
-//! An arrow without brackets carries `edit` and `create`. Arrows of the same kind chain together: if a carries edits to b and b carries edits to c, then a carries edits to c.
+//! An arrow without brackets carries `edit` and `create`, and `[all]` carries all three kinds. Arrows of the same kind chain together, so if a carries edits to b and b carries edits to c, then a carries edits to c.
 //!
 //! Resolver statements pick a winner when two sites disagree:
 //!
@@ -19,22 +19,22 @@
 //! size
 //! ```
 //!
-//! `a > b` says content from a wins over content from b; `a < b` says the reverse. `a mtime b` picks the newer file. `a size b` picks the larger file. `a name b` picks the file with the alphabetically earlier name.
-//! A bare property such as `size` applies to any pair of sites. The rules are tried in order. When a property compares equal, the next rule gets its turn.
+//! `a > b` prefers content from a over content from b, and `a < b` prefers b. `a mtime b` prefers the newer file, `a size b` the larger one, and `a name b` the one whose name sorts first.
+//! A bare property such as `size` applies to any pair of sites. Rules are tried in order, and if a property compares equal, the next rule is tried.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use anyhow::{Result, bail};
 
-/// A kind of transition. Each edge carries some subset of these.
+/// A kind of change an edge can carry: an edit, a creation, or a deletion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
-    /// New content for a replica already holding the file.
+    /// New content for a replica that has the file.
     Edit,
-    /// Content to a replica missing the file, including a restore after a deletion there.
+    /// Content for a replica that lacks the file, including a restore after the file was deleted there.
     Create,
-    /// Absence to a replica holding the file.
+    /// Deletion of the file at a replica that has it.
     Delete,
 }
 
@@ -50,7 +50,7 @@ impl Kind {
         }
     }
 
-    /// Parse a bracket keyword.
+    /// Parse a keyword from the brackets, including synonyms such as `changes` for edit and `deletion` for delete.
     fn parse(word: &str) -> Option<Kind> {
         match word {
             "edit" | "edits" | "change" | "changes" => Some(Kind::Edit),
@@ -61,7 +61,7 @@ impl Kind {
     }
 }
 
-/// A directed edge from one site to another, together with its kinds.
+/// An edge from one site to another, with the kinds it carries.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Edge {
     pub from: String,
@@ -69,16 +69,16 @@ pub struct Edge {
     pub kinds: BTreeSet<Kind>,
 }
 
-/// The flow graph with its transitive closure per kind.
+/// The flow graph, with the transitive closure of its edges for each kind.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Flow {
     edges: Vec<Edge>,
-    /// Per kind, the transitive closure of the edges of that kind, as a map from a site to the sites downstream of it.
+    /// For each kind, a map from each site to the sites downstream of it along edges of that kind.
     reach: BTreeMap<Kind, BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl Flow {
-    /// Parse flow statements.
+    /// Parse flow statements and compute the closure.
     pub fn parse(text: &str) -> Result<Flow> {
         let mut edges: Vec<Edge> = Vec::new();
         for stmt in statements(text) {
@@ -111,7 +111,7 @@ impl Flow {
         Ok(flow)
     }
 
-    /// Fill `reach` by walking the edges of each kind outward from each source site.
+    /// Fill `reach` by following the edges of each kind outward from each site with an outgoing edge of that kind.
     fn close(&mut self) {
         for kind in Kind::ALL {
             let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -132,17 +132,17 @@ impl Flow {
         }
     }
 
-    /// True when the flow carries `kind` from one site to another, directly or through other sites.
+    /// True if the flow carries `kind` from one site to another, directly or through other sites.
     pub fn carries(&self, kind: Kind, from: &str, to: &str) -> bool {
         self.reach.get(&kind).and_then(|m| m.get(from)).is_some_and(|set| set.contains(to))
     }
 
-    /// True when the flow carries nothing at all.
+    /// True if the flow has no edges.
     pub fn is_empty(&self) -> bool {
         self.edges.is_empty()
     }
 
-    /// The edges as parsed and merged.
+    /// The edges, with repeated pairs of sites merged into a single edge.
     pub fn edges(&self) -> &[Edge] {
         &self.edges
     }
@@ -157,12 +157,12 @@ impl Flow {
         self.reach.get(&kind).expect("closure is computed for each kind")
     }
 
-    /// True when any edge carries `kind` into `site`.
+    /// True if some edge carries `kind` into `site`.
     pub fn has_incoming(&self, kind: Kind, site: &str) -> bool {
         self.edges.iter().any(|e| e.to == site && e.kinds.contains(&kind))
     }
 
-    /// True when any edge carries `kind` out of `site`.
+    /// True if some edge carries `kind` out of `site`.
     pub fn has_outgoing(&self, kind: Kind, site: &str) -> bool {
         self.edges.iter().any(|e| e.from == site && e.kinds.contains(&kind))
     }
@@ -179,7 +179,7 @@ impl fmt::Display for Flow {
     }
 }
 
-/// Merge an edge into the list, uniting kinds when the same pair already exists.
+/// Add an edge to the list, or add its kinds to the edge already there between the same two sites.
 fn add_edge(edges: &mut Vec<Edge>, from: &str, to: &str, kinds: &BTreeSet<Kind>) {
     match edges.iter_mut().find(|e| e.from == from && e.to == to) {
         Some(e) => e.kinds.extend(kinds.iter().copied()),
@@ -250,7 +250,7 @@ impl Property {
 pub enum Rule {
     /// Content from `winner` beats content from `loser`.
     Beats { winner: String, loser: String },
-    /// Compare a property between the sites of a pair, or between any pair when `pair` is None.
+    /// Compare a property between two sites, or between any two sites if `pair` is None.
     Compare { pair: Option<(String, String)>, by: Property },
 }
 
@@ -264,7 +264,7 @@ impl fmt::Display for Rule {
     }
 }
 
-/// Parse resolver statements.
+/// Parse resolver statements. A statement with sets of sites in braces gives a rule for each pair.
 pub fn parse_rules(text: &str) -> Result<Vec<Rule>> {
     let mut rules = Vec::new();
     for stmt in statements(text) {
@@ -334,12 +334,12 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// Parse both texts.
+    /// Parse the flow and resolver texts.
     pub fn parse(flow: &str, resolve: &str) -> Result<Policy> {
         Ok(Policy { flow: Flow::parse(flow)?, resolve: parse_rules(resolve)? })
     }
 
-    /// A stable text of the policy. The relation fingerprint is a hash over this text, so the daemon re-evaluates all keys after a policy change.
+    /// The policy as stable text. The relation fingerprint is a hash of this text, so a policy change makes the engine decide each key again.
     pub fn fingerprint_text(&self) -> String {
         let rules: Vec<String> = self.resolve.iter().map(|r| r.to_string()).collect();
         format!("{} ; resolve: {}", self.flow, rules.join("; "))

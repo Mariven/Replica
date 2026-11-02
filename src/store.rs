@@ -1,6 +1,6 @@
-//! The state database. It holds the basis of each key at each replica, the unresolved marks, the intent journal, the archive rows, persisted settings, relation fingerprints, and the path behind each replica identity.
+//! The state database. It holds the basis of each key at each replica, the unresolved marks, the intent journal, the archive rows, the settings, the fingerprint of each relation, and the pattern behind each replica id.
 //!
-//! SQLite runs in write-ahead mode, so the dashboard can read while the engine writes. The schema is at version 2. A database from the first design is refused, since its replica identities and record states do not carry over.
+//! SQLite runs in write-ahead mode, so the dashboard can read while the engine writes. The schema is at version 2. A database at any other version is refused, since its records cannot be carried over.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -18,17 +18,17 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// The bases of a relation, indexed by canonical key text and then by replica id.
 pub type RecordMap = BTreeMap<String, BTreeMap<String, Basis>>;
 
-/// The open database.
+/// A connection to the state database.
 pub struct Store {
     conn: Connection,
 }
 
-/// Milliseconds since the Unix epoch, as stored.
+/// A time as milliseconds since the Unix epoch, the form the database stores.
 pub fn to_epoch_ms(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
-/// A system time from stored milliseconds.
+/// Convert stored milliseconds back to a time.
 pub fn from_epoch_ms(ms: i64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
 }
@@ -49,16 +49,16 @@ pub struct ArchiveEntry {
     pub at: SystemTime,
 }
 
-/// What noting a replica's pattern found in the store: nothing yet, the same pattern, or a different one.
+/// The result of `note_replica`: the replica is new, its pattern is unchanged, or its pattern has moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Noted {
     New,
     Same,
-    /// The pattern stored before, which differs from the one noted now.
+    /// The pattern stored before the move.
     Moved(String),
 }
 
-/// An intent row: the relation and key under a plan, plus the text of the plan.
+/// An intent row: the relation and key of a plan in progress, with a description of the plan.
 pub struct Intent {
     pub relation: String,
     pub key: Key,
@@ -66,7 +66,7 @@ pub struct Intent {
 }
 
 impl Store {
-    /// Open or create the database. Parent directories are created and the schema is applied; a database at any other schema version is refused.
+    /// Open the database at `path`, creating the file, its parent directories, and the tables if needed. A database at a different schema version is refused.
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -150,25 +150,25 @@ impl Store {
         outcome
     }
 
-    // Settings: the gate and pause flags, plus any other small value the daemon persists.
+    // Settings are small persisted values, such as the schema version and the gate flags.
 
-    /// Read a setting.
+    /// The stored value of a setting, or None if it was never set.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self.conn.prepare_cached("SELECT value FROM setting WHERE key=?1")?.query_row(params![key], |r| r.get(0)).optional()?)
     }
 
-    /// Write a setting.
+    /// Store a setting, replacing any earlier value.
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.conn.prepare_cached("INSERT INTO setting (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value=?2")?.execute(params![key, value])?;
         Ok(())
     }
 
-    /// Read a boolean setting, None when unset.
+    /// A setting read as a boolean, or None if it was never set.
     pub fn flag(&self, key: &str) -> Result<Option<bool>> {
         Ok(self.setting(key)?.map(|v| v == "true"))
     }
 
-    /// Write a boolean setting.
+    /// Store a boolean setting as `true` or `false`.
     pub fn set_flag(&self, key: &str, value: bool) -> Result<()> {
         self.set_setting(key, if value { "true" } else { "false" })
     }
@@ -186,7 +186,7 @@ impl Store {
         Ok(())
     }
 
-    /// Record the path behind a replica identity, returning the previously stored path when it differs.
+    /// Store the pattern behind a replica id and report how it compares with the pattern stored before.
     pub fn note_replica(&self, relation: &str, id: &str, path: &Path) -> Result<Noted> {
         let text = path.display().to_string();
         let previous: Option<String> = self.conn.prepare_cached("SELECT path FROM replica WHERE rel=?1 AND id=?2")?.query_row(params![relation, id], |r| r.get(0)).optional()?;
@@ -199,20 +199,20 @@ impl Store {
         })
     }
 
-    /// True when the replica's pattern has been noted before, so it is not new to the relation.
+    /// True if a pattern has been stored for this replica, so the replica is not new to the relation.
     pub fn replica_known(&self, relation: &str, id: &str) -> Result<bool> {
         let n: i64 = self.conn.prepare_cached("SELECT COUNT(*) FROM replica WHERE rel=?1 AND id=?2")?.query_row(params![relation, id], |r| r.get(0))?;
         Ok(n > 0)
     }
 
-    /// Replica identities with records in a relation.
+    /// Ids of the replicas with records in a relation.
     pub fn replicas_with_records(&self, relation: &str) -> Result<BTreeSet<String>> {
         let mut stmt = self.conn.prepare_cached("SELECT DISTINCT replica FROM record WHERE rel=?1")?;
         let rows = stmt.query_map(params![relation], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
-    /// Drop the records, unresolved marks, and stored path of a replica.
+    /// Drop the records, unresolved marks, and stored pattern of a replica, and return the number of records dropped.
     pub fn forget_replica(&self, relation: &str, id: &str) -> Result<usize> {
         let n = self.conn.prepare_cached("DELETE FROM record WHERE rel=?1 AND replica=?2")?.execute(params![relation, id])?;
         self.conn.prepare_cached("DELETE FROM unresolved WHERE rel=?1 AND replica=?2")?.execute(params![relation, id])?;
@@ -222,7 +222,7 @@ impl Store {
 
     // Records.
 
-    /// Load the bases of a relation in a single query.
+    /// All the bases of a relation, loaded in a single query.
     pub fn records_for(&self, relation: &str) -> Result<RecordMap> {
         let mut stmt = self.conn.prepare_cached("SELECT key, replica, present, mtime, size, hash FROM record WHERE rel=?1")?;
         let rows = stmt.query_map(params![relation], |r| {
@@ -289,7 +289,7 @@ impl Store {
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
-    /// Mark a replica of a key unresolved with a reason.
+    /// Mark a key unresolved at a replica, with the reason it is held.
     pub fn mark_unresolved(&self, relation: &str, key: &Key, replica: &str, reason: &str) -> Result<()> {
         self.conn.prepare_cached(
             "INSERT INTO unresolved (rel, key, replica, reason) VALUES (?1,?2,?3,?4) ON CONFLICT (rel, key, replica) DO UPDATE SET reason=?4",
@@ -297,7 +297,7 @@ impl Store {
         Ok(())
     }
 
-    /// Clear the unresolved mark of a replica of a key.
+    /// Remove the unresolved mark of a key at a replica.
     pub fn clear_unresolved(&self, relation: &str, key: &Key, replica: &str) -> Result<()> {
         self.conn.prepare_cached("DELETE FROM unresolved WHERE rel=?1 AND key=?2 AND replica=?3")?.execute(params![relation, key.canonical(), replica])?;
         Ok(())
@@ -305,7 +305,7 @@ impl Store {
 
     // The intent journal.
 
-    /// Journal a plan before it applies.
+    /// Record the plan for a key before the executor applies it.
     pub fn write_intent(&self, relation: &str, key: &Key, detail: &str) -> Result<()> {
         self.conn.prepare_cached(
             "INSERT INTO intent (rel, key, detail, started) VALUES (?1,?2,?3,?4) ON CONFLICT (rel, key) DO UPDATE SET detail=?3, started=?4",
@@ -313,13 +313,13 @@ impl Store {
         Ok(())
     }
 
-    /// Remove the journal row of a key.
+    /// Remove the intent row of a key.
     pub fn clear_intent(&self, relation: &str, key: &Key) -> Result<()> {
         self.conn.prepare_cached("DELETE FROM intent WHERE rel=?1 AND key=?2")?.execute(params![relation, key.canonical()])?;
         Ok(())
     }
 
-    /// Journal rows left behind, meaning a plan did not finish.
+    /// Intent rows left behind by plans that did not finish, oldest first.
     pub fn stale_intents(&self) -> Result<Vec<Intent>> {
         let mut stmt = self.conn.prepare("SELECT rel, key, detail FROM intent ORDER BY started")?;
         let rows = stmt.query_map([], |r| Ok(Intent { relation: r.get(0)?, key: Key::parse(&r.get::<_, String>(1)?), detail: r.get(2)? }))?;
@@ -333,7 +333,7 @@ impl Store {
         Ok((records as u64, intents as u64))
     }
 
-    // Archive rows. The blob store holds the bytes; a row here records the key, replica, path, and reason behind an archived blob.
+    // Archive rows. Each row records where an archived blob came from: the key, replica, path, and reason. The bytes are in the blob store.
 
     /// Insert an archive row and return its id, so the caller can exempt the row from eviction.
     pub fn archive_insert(&self, relation: &str, key: &Key, replica: &str, path: &Path, hash: &Hash, size: u64, reason: &str) -> Result<i64> {
@@ -343,13 +343,13 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Bytes held by distinct archived hashes.
+    /// Total size of the archived blobs, counting each hash once.
     pub fn archive_unique_bytes(&self) -> Result<u64> {
         let n: i64 = self.conn.query_row("SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT hash, size FROM archive)", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
-    /// Archive rows and unique bytes together, for the dashboard.
+    /// The number of archive rows and the total size of their blobs, for the dashboard.
     pub fn archive_stats(&self) -> Result<(u64, u64)> {
         let rows: i64 = self.conn.query_row("SELECT COUNT(*) FROM archive", [], |r| r.get(0))?;
         Ok((rows as u64, self.archive_unique_bytes()?))
@@ -360,7 +360,7 @@ impl Store {
         Ok(self.conn.prepare_cached("SELECT rel FROM archive WHERE id<>?1 GROUP BY rel ORDER BY SUM(size) DESC LIMIT 1")?.query_row(params![keep], |r| r.get(0)).optional()?)
     }
 
-    /// The oldest archive row of a relation other than `keep`, as id and hash.
+    /// The id and hash of the oldest archive row of a relation, skipping row `keep`.
     pub fn archive_oldest_row(&self, relation: &str, keep: i64) -> Result<Option<(i64, Hash)>> {
         let row: Option<(i64, Vec<u8>)> = self.conn.prepare_cached("SELECT id, hash FROM archive WHERE rel=?1 AND id<>?2 ORDER BY at ASC, id ASC LIMIT 1")?
             .query_row(params![relation, keep], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
@@ -400,7 +400,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A small snapshot whose hash is the given byte repeated.
+    /// A test snapshot with each byte of its hash set to `hash`.
     fn snap(hash: u8) -> Snapshot {
         Snapshot { mtime: from_epoch_ms(1_700_000_000_000), size: 3, hash: [hash; 32] }
     }
