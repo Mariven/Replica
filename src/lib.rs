@@ -13,6 +13,9 @@
 //! - [`action`]: shell commands for actions and transforms.
 //! - [`engine`]: cycles, discovery, reports, gates.
 //! - [`config`]: loading and validating the configuration.
+//! - [`watch`]: filesystem change notification feeding the main loop.
+//! - [`dashboard`]: the loopback HTTP dashboard.
+//! - [`cli`]: subcommands and the ones that run without a daemon.
 
 pub mod pattern;
 pub mod site;
@@ -27,3 +30,6 @@ pub mod event;
 pub mod action;
 pub mod engine;
 pub mod config;
+pub mod watch;
+pub mod dashboard;
+pub mod cli;
