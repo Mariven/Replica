@@ -1,16 +1,19 @@
 # Running Replica as a macOS service
 
-Replica runs as a per-user LaunchAgent. launchd starts it at login, relaunches it after a crash, and leaves it down after a clean exit.
+Replica runs as a per-user LaunchAgent. launchd starts it at login and restarts it if it crashes.
+
 
 ## Install
 
-Build, then write the agent plist and load it:
+Build the release binary, create the log folder (launchd does not create it), and check the configuration:
 
 ```sh
 cargo build --release
+mkdir -p ~/scripts/replica/live/logs
+./target/release/replica check --config config.yaml
 ```
 
-`~/Library/LaunchAgents/com.mariven.replica.plist` (adjust paths):
+Write this to `~/Library/LaunchAgents/com.mariven.replica.plist`, with `YOU` replaced by your user name:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,6 +25,7 @@ cargo build --release
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/scripts/replica/target/release/replica</string>
+        <string>run</string>
         <string>--config</string>
         <string>/Users/YOU/scripts/replica/config.yaml</string>
     </array>
@@ -32,6 +36,10 @@ cargo build --release
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
     <key>StandardOutPath</key>
     <string>/Users/YOU/scripts/replica/live/logs/daemon.log</string>
     <key>StandardErrorPath</key>
@@ -40,60 +48,43 @@ cargo build --release
 </plist>
 ```
 
+Then load it:
+
 ```sh
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.mariven.replica.plist
 ```
 
-`KeepAlive` with `SuccessfulExit: false` means: relaunch on any nonzero exit, stay down after a clean one. The dashboard's restart button exits nonzero on purpose. Its halt button exits cleanly on purpose.
+With `SuccessfulExit` set to false under `KeepAlive`, launchd restarts the daemon after a crash or a nonzero exit and leaves it stopped after a clean exit. Replica's restart and halt depend on this: `replica restart` exits with status 1, so launchd starts a fresh process, while `replica halt` exits with status 0, so the service stays stopped. `ProcessType` and `LowPriorityIO` keep the folder walks from competing with foreground work.
 
-## Control
 
-The dashboard (`dashboard.port` in the config) is the main interface. Its controls are ordinary POSTs to the loopback server, so they are also scriptable:
+## Day to day
+
+The dashboard and the `replica` commands control the running daemon, as described in the README. From the shell, launchd can also start a halted daemon or restart a running one:
 
 ```sh
-curl -X POST localhost:18516/pause    # stop cycling; keep serving the dashboard
-curl -X POST localhost:18516/resume   # cycle again immediately
-curl -X POST localhost:18516/restart  # exit nonzero; launchd relaunches and rereads the config
-curl -X POST localhost:18516/halt     # exit cleanly; launchd leaves it stopped
+launchctl kickstart gui/$UID/com.mariven.replica
+launchctl kickstart -k gui/$UID/com.mariven.replica
 ```
 
-`GET /status.json` returns machine-readable state (running/paused, pid, uptime, last and next sync, cycle/op/error counts, files awaiting sync) for scripts and menubar widgets.
+The daemon reads its configuration only at startup. After editing `config.yaml`, run `replica check` and then `replica restart`. If the new configuration fails to load, the daemon refuses the restart and keeps running on the old one. To run new code, build the release binary and restart the same way, since the agent runs the binary straight from `target/release`.
 
-Use `launchctl` for things the process cannot do from inside:
-
-```sh
-launchctl kickstart gui/$UID/com.mariven.replica     # start (for example after halt)
-launchctl kickstart -k gui/$UID/com.mariven.replica  # kill and restart
-launchctl print gui/$UID/com.mariven.replica         # detailed status
-```
-
-## Maintain
-
-Change the config: edit `config.yaml`, then `POST /restart`. The config is read once at startup; nothing watches it.
-
-Update the code: `cargo build --release`, then `POST /restart`. The agent runs the binary from `target/release` in place.
-
-Edit the plist: launchd does not reread a plist on kickstart. Reload it:
+After editing the plist itself, launchd has to load it again:
 
 ```sh
-launchctl bootout gui/$UID com.mariven.replica
+launchctl bootout gui/$UID/com.mariven.replica
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.mariven.replica.plist
 ```
 
-If bootout reports an I/O error while the job is crash-looping, the older `launchctl unload ~/Library/LaunchAgents/com.mariven.replica.plist` still dislodges it.
+Before rearranging synced folders by hand, pause the daemon, and resume it once the dashboard shows what you expect. Halt the service before running `replica run --once` against the same state folder, since only one daemon can hold the lock.
 
-Read the logs: `live/logs/daemon.err` is the event stream (one line per resolution, skip, or error). `daemon.log` is stdout. Entries with a `log:` path also append their own events there.
+Events and errors go to `daemon.err`, one line each, stamped with the local time. A relation with a `log` setting also writes its own events to that file.
 
-Risky edits: `POST /pause` first, move files around, check that the dashboard shows what you expect, then `POST /resume`.
-
-Do not run `--once` against the live state database while the service is up: the two processes would race on the same record. Pause or halt first.
 
 ## Remove
 
 ```sh
-curl -X POST localhost:18516/halt
-launchctl bootout gui/$UID com.mariven.replica
+launchctl bootout gui/$UID/com.mariven.replica
 rm ~/Library/LaunchAgents/com.mariven.replica.plist
 ```
 
-The state database and logs live in `live/`. Delete that folder to forget everything on record. Removal does not touch the synced files themselves.
+Deleting the state folder leaves the synced files in place but loses the records and the archive, and the next run starts as a first run. If you move or back up the database, keep `state.db` together with its `-wal` and `-shm` files.

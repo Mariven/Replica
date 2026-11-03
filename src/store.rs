@@ -1,244 +1,466 @@
-//! The last-sync record and the intent journal.
+//! The state database. It holds the basis of each key at each replica, the unresolved marks, the intent journal, the archive rows, the settings, the fingerprint of each relation, and the pattern behind each replica id.
 //!
-//! Each (relation, identifier, ref) has a record row.
-//! We write an intent before a mutation and clear it after commit. A leftover intent means the last run died mid-write.
+//! SQLite runs in write-ahead mode, so the dashboard can read while the engine writes. The schema is at version 2. A database at any other version is refused, since its records cannot be carried over.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::identifier::{Identifier, identifier_from_string, identifier_to_string};
-use crate::status::Snapshot;
+use crate::observe::{Basis, Hash, Snapshot};
+use crate::site::Key;
 
-/// The SQLite file that holds the last-sync record, the intent journal, and the archive index.
+/// Schema version written to the `setting` table when a database is created.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The bases of a relation, indexed by canonical key text and then by replica id.
+pub type RecordMap = BTreeMap<String, BTreeMap<String, Basis>>;
+
+/// A connection to the state database.
 pub struct Store {
     conn: Connection,
 }
 
+/// A time as milliseconds since the Unix epoch, the form the database stores.
+pub fn to_epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
+/// Convert stored milliseconds back to a time.
+pub fn from_epoch_ms(ms: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64)
+}
+
+/// The current time in epoch milliseconds, for the `seen` and `started` columns.
+fn now_ms() -> i64 {
+    to_epoch_ms(SystemTime::now())
+}
+
+/// An archived revision as listed on the history page.
+pub struct ArchiveEntry {
+    pub key: String,
+    pub replica: String,
+    pub path: String,
+    pub hash: Hash,
+    pub size: u64,
+    pub reason: String,
+    pub at: SystemTime,
+}
+
+/// The result of `note_replica`: the replica is new, its pattern is unchanged, or its pattern has moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Noted {
+    New,
+    Same,
+    /// The pattern stored before the move.
+    Moved(String),
+}
+
+/// An intent row: the relation and key of a plan in progress, with a description of the plan.
+pub struct Intent {
+    pub relation: String,
+    pub key: Key,
+    pub detail: String,
+}
+
 impl Store {
-    /// Open the SQLite file (creating it if needed) and make sure the tables exist.
+    /// Open the database at `path`, creating the file, its parent directories, and the tables if needed. A database at a different schema version is refused.
     pub fn open(path: &Path) -> Result<Store> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let existing: Option<String> = conn.query_row("SELECT value FROM setting WHERE key='schema_version'", [], |r| r.get(0)).optional().unwrap_or(None);
+        if let Some(v) = existing {
+            let found: u32 = v.parse().unwrap_or(0);
+            if found != SCHEMA_VERSION {
+                bail!("{} has schema version {found}; this replica uses version {SCHEMA_VERSION}. Start a fresh state directory; the first cycle aligns identical files and holds differing ones", path.display());
+            }
+        }
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS record (
+            "PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS setting (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS relation (
+                name        TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS replica (
                 rel     TEXT NOT NULL,
-                ident   TEXT NOT NULL,
-                ref     TEXT NOT NULL,
+                id      TEXT NOT NULL,
+                path    TEXT NOT NULL,
+                seen    INTEGER NOT NULL,
+                PRIMARY KEY (rel, id)
+            );
+            CREATE TABLE IF NOT EXISTS record (
+                rel     TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                replica TEXT NOT NULL,
+                present INTEGER NOT NULL,
                 mtime   INTEGER,
                 size    INTEGER,
                 hash    BLOB,
-                PRIMARY KEY (rel, ident, ref)
+                PRIMARY KEY (rel, key, replica)
+            );
+            CREATE TABLE IF NOT EXISTS unresolved (
+                rel     TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                replica TEXT NOT NULL,
+                reason  TEXT NOT NULL,
+                PRIMARY KEY (rel, key, replica)
             );
             CREATE TABLE IF NOT EXISTS intent (
                 rel     TEXT NOT NULL,
-                ident   TEXT NOT NULL,
+                key     TEXT NOT NULL,
                 detail  TEXT NOT NULL,
                 started INTEGER NOT NULL,
-                PRIMARY KEY (rel, ident)
+                PRIMARY KEY (rel, key)
             );
             CREATE TABLE IF NOT EXISTS archive (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 rel     TEXT NOT NULL,
-                ident   TEXT NOT NULL,
-                ref     TEXT NOT NULL,
+                key     TEXT NOT NULL,
+                replica TEXT NOT NULL,
                 path    TEXT NOT NULL,
-                hash    TEXT NOT NULL,
+                hash    BLOB NOT NULL,
                 size    INTEGER NOT NULL,
                 reason  TEXT NOT NULL,
                 at      INTEGER NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS archive_hash ON archive (hash);
+            CREATE INDEX IF NOT EXISTS archive_rel_at_id ON archive (rel, at, id);",
         )?;
+        conn.execute("INSERT OR IGNORE INTO setting (key, value) VALUES ('schema_version', ?1)", params![SCHEMA_VERSION.to_string()])?;
         Ok(Store { conn })
     }
 
-    /// Fetch the record for this slot.
-    /// Outer `None` means we have never recorded this slot. Inner `None` means we recorded that the file was absent.
-    pub fn record(&self, relation: &str, ident: &Identifier, rf: &str) -> Result<Option<Option<Snapshot>>> {
-        let row = self.conn.query_row(
-            "SELECT mtime, size, hash FROM record WHERE rel=?1 AND ident=?2 AND ref=?3",
-            params![relation, identifier_to_string(ident), rf],
-            |r| {
-                let mtime: Option<i64> = r.get(0)?;
-                let size: Option<i64> = r.get(1)?;
-                let hash: Option<Vec<u8>> = r.get(2)?;
-                Ok(match (mtime, size, hash) {
-                    (Some(m), Some(s), Some(h)) => Some(Snapshot {
-                        mtime: SystemTime::UNIX_EPOCH + Duration::from_millis(m as u64),
-                        size: s as u64,
-                        hash: h.try_into().unwrap_or([0; 32]),
-                    }),
-                    _ => None,
-                })
-            },
-        ).optional()?;
-        Ok(row)
+    /// Run `f` inside a transaction, committing on success and rolling back on error.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let outcome = f(self).and_then(|v| self.conn.execute_batch("COMMIT").map(|_| v).map_err(Into::into));
+        if outcome.is_err() {
+            // A failed commit leaves the transaction open, so later statements must not join it.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        outcome
     }
 
-    /// Save the snapshot we just wrote, or record that the file is absent.
-    pub fn commit_record(&self, relation: &str, ident: &Identifier, rf: &str, snapshot: Option<&Snapshot>) -> Result<()> {
-        let (mtime, size, hash) = match snapshot {
-            Some(s) => (
-                Some(s.mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as i64),
-                Some(s.size as i64),
-                Some(s.hash.to_vec()),
-            ),
-            None => (None, None, None),
-        };
-        self.conn.execute(
-            "INSERT INTO record (rel, ident, ref, mtime, size, hash) VALUES (?1,?2,?3,?4,?5,?6)
-             ON CONFLICT (rel, ident, ref) DO UPDATE SET mtime=?4, size=?5, hash=?6",
-            params![relation, identifier_to_string(ident), rf, mtime, size, hash],
-        )?;
+    // Settings are small persisted values, such as the schema version and the gate flags.
+
+    /// The stored value of a setting, or None if it was never set.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.prepare_cached("SELECT value FROM setting WHERE key=?1")?.query_row(params![key], |r| r.get(0)).optional()?)
+    }
+
+    /// Store a setting, replacing any earlier value.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.prepare_cached("INSERT INTO setting (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value=?2")?.execute(params![key, value])?;
         Ok(())
     }
 
-    /// Identifiers that have any record for this relation.
-    /// We include these so a file deleted at every visible ref is still found.
-    pub fn known_identifiers(&self, relation: &str) -> Result<Vec<Identifier>> {
-        let mut stmt = self.conn.prepare("SELECT DISTINCT ident FROM record WHERE rel=?1")?;
-        let idents = stmt
-            .query_map(params![relation], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
-        Ok(idents.iter().map(|i| identifier_from_string(i)).collect())
+    /// A setting read as a boolean, or None if it was never set.
+    pub fn flag(&self, key: &str) -> Result<Option<bool>> {
+        Ok(self.setting(key)?.map(|v| v == "true"))
     }
 
-    /// This ref has committed a present snapshot at some point.
-    /// That distinguishes a brand-new root from a recorded root that disappeared (often an unmounted volume).
-    pub fn ref_has_records(&self, relation: &str, rf: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM record WHERE rel=?1 AND ref=?2 AND mtime IS NOT NULL",
-            params![relation, rf],
-            |r| r.get(0),
-        )?;
+    /// Store a boolean setting as `true` or `false`.
+    pub fn set_flag(&self, key: &str, value: bool) -> Result<()> {
+        self.set_setting(key, if value { "true" } else { "false" })
+    }
+
+    // Relations and replicas.
+
+    /// The stored policy fingerprint of a relation.
+    pub fn fingerprint(&self, relation: &str) -> Result<Option<String>> {
+        Ok(self.conn.prepare_cached("SELECT fingerprint FROM relation WHERE name=?1")?.query_row(params![relation], |r| r.get(0)).optional()?)
+    }
+
+    /// Store the policy fingerprint of a relation.
+    pub fn set_fingerprint(&self, relation: &str, fingerprint: &str) -> Result<()> {
+        self.conn.prepare_cached("INSERT INTO relation (name, fingerprint) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET fingerprint=?2")?.execute(params![relation, fingerprint])?;
+        Ok(())
+    }
+
+    /// Store the pattern behind a replica id and report how it compares with the pattern stored before.
+    pub fn note_replica(&self, relation: &str, id: &str, path: &Path) -> Result<Noted> {
+        let text = path.display().to_string();
+        let previous: Option<String> = self.conn.prepare_cached("SELECT path FROM replica WHERE rel=?1 AND id=?2")?.query_row(params![relation, id], |r| r.get(0)).optional()?;
+        self.conn.prepare_cached("INSERT INTO replica (rel, id, path, seen) VALUES (?1, ?2, ?3, ?4) ON CONFLICT (rel, id) DO UPDATE SET path=?3, seen=?4")?
+            .execute(params![relation, id, text, now_ms()])?;
+        Ok(match previous {
+            None => Noted::New,
+            Some(p) if p == text => Noted::Same,
+            Some(p) => Noted::Moved(p),
+        })
+    }
+
+    /// True if a pattern has been stored for this replica, so the replica is not new to the relation.
+    pub fn replica_known(&self, relation: &str, id: &str) -> Result<bool> {
+        let n: i64 = self.conn.prepare_cached("SELECT COUNT(*) FROM replica WHERE rel=?1 AND id=?2")?.query_row(params![relation, id], |r| r.get(0))?;
         Ok(n > 0)
     }
 
-    /// Delete the record rows for an identifier that is now missing everywhere.
-    pub fn forget(&self, relation: &str, ident: &Identifier) -> Result<()> {
-        self.conn.execute("DELETE FROM record WHERE rel=?1 AND ident=?2", params![relation, identifier_to_string(ident)])?;
+    /// Ids of the replicas with records in a relation.
+    pub fn replicas_with_records(&self, relation: &str) -> Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT DISTINCT replica FROM record WHERE rel=?1")?;
+        let rows = stmt.query_map(params![relation], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Drop the records, unresolved marks, and stored pattern of a replica, and return the number of records dropped.
+    pub fn forget_replica(&self, relation: &str, id: &str) -> Result<usize> {
+        let n = self.conn.prepare_cached("DELETE FROM record WHERE rel=?1 AND replica=?2")?.execute(params![relation, id])?;
+        self.conn.prepare_cached("DELETE FROM unresolved WHERE rel=?1 AND replica=?2")?.execute(params![relation, id])?;
+        self.conn.prepare_cached("DELETE FROM replica WHERE rel=?1 AND id=?2")?.execute(params![relation, id])?;
+        Ok(n)
+    }
+
+    // Records.
+
+    /// All the bases of a relation, loaded in a single query.
+    pub fn records_for(&self, relation: &str) -> Result<RecordMap> {
+        let mut stmt = self.conn.prepare_cached("SELECT key, replica, present, mtime, size, hash FROM record WHERE rel=?1")?;
+        let rows = stmt.query_map(params![relation], |r| {
+            let key: String = r.get(0)?;
+            let replica: String = r.get(1)?;
+            let present: i64 = r.get(2)?;
+            let basis = if present == 0 {
+                Basis::Tombstone
+            } else {
+                let hash: Vec<u8> = r.get(5)?;
+                Basis::Snapshot(Snapshot {
+                    mtime: from_epoch_ms(r.get(3)?),
+                    size: r.get::<_, i64>(4)? as u64,
+                    hash: hash.try_into().unwrap_or([0; 32]),
+                })
+            };
+            Ok((key, replica, basis))
+        })?;
+        let mut out: RecordMap = BTreeMap::new();
+        for row in rows {
+            let (key, replica, basis) = row?;
+            out.entry(key).or_default().insert(replica, basis);
+        }
+        Ok(out)
+    }
+
+    /// Write the basis of a key at a replica. A `None` basis removes the row.
+    pub fn commit_record(&self, relation: &str, key: &Key, replica: &str, basis: &Basis) -> Result<()> {
+        let key = key.canonical();
+        match basis {
+            Basis::None => {
+                self.conn.prepare_cached("DELETE FROM record WHERE rel=?1 AND key=?2 AND replica=?3")?.execute(params![relation, key, replica])?;
+            }
+            Basis::Tombstone => {
+                self.conn.prepare_cached(
+                    "INSERT INTO record (rel, key, replica, present, mtime, size, hash) VALUES (?1,?2,?3,0,NULL,NULL,NULL)
+                     ON CONFLICT (rel, key, replica) DO UPDATE SET present=0, mtime=NULL, size=NULL, hash=NULL",
+                )?.execute(params![relation, key, replica])?;
+            }
+            Basis::Snapshot(s) => {
+                self.conn.prepare_cached(
+                    "INSERT INTO record (rel, key, replica, present, mtime, size, hash) VALUES (?1,?2,?3,1,?4,?5,?6)
+                     ON CONFLICT (rel, key, replica) DO UPDATE SET present=1, mtime=?4, size=?5, hash=?6",
+                )?.execute(params![relation, key, replica, to_epoch_ms(s.mtime), s.size as i64, s.hash.to_vec()])?;
+            }
+        }
         Ok(())
     }
 
-    /// Write the operations we are about to run, so a crash leaves a trail.
-    pub fn write_intent(&self, relation: &str, ident: &Identifier, detail: &str) -> Result<()> {
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-        self.conn.execute(
-            "INSERT INTO intent (rel, ident, detail, started) VALUES (?1,?2,?3,?4)
-             ON CONFLICT (rel, ident) DO UPDATE SET detail=?3, started=?4",
-            params![relation, identifier_to_string(ident), detail, now],
-        )?;
+    /// Drop the records and unresolved marks of a key at all replicas.
+    pub fn forget(&self, relation: &str, key: &Key) -> Result<()> {
+        let key = key.canonical();
+        self.conn.prepare_cached("DELETE FROM record WHERE rel=?1 AND key=?2")?.execute(params![relation, key])?;
+        self.conn.prepare_cached("DELETE FROM unresolved WHERE rel=?1 AND key=?2")?.execute(params![relation, key])?;
         Ok(())
     }
 
-    /// Delete the intent after a successful commit.
-    pub fn clear_intent(&self, relation: &str, ident: &Identifier) -> Result<()> {
-        self.conn.execute("DELETE FROM intent WHERE rel=?1 AND ident=?2", params![relation, identifier_to_string(ident)])?;
+    // Unresolved marks.
+
+    /// Keys of a relation with an unresolved mark on any replica.
+    pub fn unresolved_for(&self, relation: &str) -> Result<BTreeSet<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT DISTINCT key FROM unresolved WHERE rel=?1")?;
+        let rows = stmt.query_map(params![relation], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Mark a key unresolved at a replica, with the reason it is held.
+    pub fn mark_unresolved(&self, relation: &str, key: &Key, replica: &str, reason: &str) -> Result<()> {
+        self.conn.prepare_cached(
+            "INSERT INTO unresolved (rel, key, replica, reason) VALUES (?1,?2,?3,?4) ON CONFLICT (rel, key, replica) DO UPDATE SET reason=?4",
+        )?.execute(params![relation, key.canonical(), replica, reason])?;
         Ok(())
     }
 
-    /// Record-row count and intent-row count. The dashboard status strip uses these.
+    /// Remove the unresolved mark of a key at a replica.
+    pub fn clear_unresolved(&self, relation: &str, key: &Key, replica: &str) -> Result<()> {
+        self.conn.prepare_cached("DELETE FROM unresolved WHERE rel=?1 AND key=?2 AND replica=?3")?.execute(params![relation, key.canonical(), replica])?;
+        Ok(())
+    }
+
+    // The intent journal.
+
+    /// Record the plan for a key before the executor applies it.
+    pub fn write_intent(&self, relation: &str, key: &Key, detail: &str) -> Result<()> {
+        self.conn.prepare_cached(
+            "INSERT INTO intent (rel, key, detail, started) VALUES (?1,?2,?3,?4) ON CONFLICT (rel, key) DO UPDATE SET detail=?3, started=?4",
+        )?.execute(params![relation, key.canonical(), detail, now_ms()])?;
+        Ok(())
+    }
+
+    /// Remove the intent row of a key.
+    pub fn clear_intent(&self, relation: &str, key: &Key) -> Result<()> {
+        self.conn.prepare_cached("DELETE FROM intent WHERE rel=?1 AND key=?2")?.execute(params![relation, key.canonical()])?;
+        Ok(())
+    }
+
+    /// Intent rows left behind by plans that did not finish, oldest first.
+    pub fn stale_intents(&self) -> Result<Vec<Intent>> {
+        let mut stmt = self.conn.prepare("SELECT rel, key, detail FROM intent ORDER BY started")?;
+        let rows = stmt.query_map([], |r| Ok(Intent { relation: r.get(0)?, key: Key::parse(&r.get::<_, String>(1)?), detail: r.get(2)? }))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Row counts of records and intents, for the dashboard.
     pub fn stats(&self) -> Result<(u64, u64)> {
         let records: i64 = self.conn.query_row("SELECT COUNT(*) FROM record", [], |r| r.get(0))?;
         let intents: i64 = self.conn.query_row("SELECT COUNT(*) FROM intent", [], |r| r.get(0))?;
         Ok((records as u64, intents as u64))
     }
 
-    // The archive index: which filenames held which content, and when.
-    // Blob bytes live in the Archive directory, keyed by content hash.
-    // These rows are the only map from (relation, file, time) back to a hash, so eviction works row-first.
+    // Archive rows. Each row records where an archived blob came from: the key, replica, path, and reason. The bytes are in the blob store.
 
-    /// Record that this content (by hash) was at `path` until now.
-    pub fn archive_insert(&self, relation: &str, ident: &Identifier, ref_id: &str, path: &Path, hex: &str, size: u64, reason: &str) -> Result<()> {
-        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-        self.conn.execute(
-            "INSERT INTO archive (rel, ident, ref, path, hash, size, reason, at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![relation, identifier_to_string(ident), ref_id, path.display().to_string(), hex, size as i64, reason, now],
-        )?;
-        Ok(())
+    /// Insert an archive row and return its id, so the caller can exempt the row from eviction.
+    pub fn archive_insert(&self, relation: &str, key: &Key, replica: &str, path: &Path, hash: &Hash, size: u64, reason: &str) -> Result<i64> {
+        self.conn.prepare_cached(
+            "INSERT INTO archive (rel, key, replica, path, hash, size, reason, at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        )?.execute(params![relation, key.canonical(), replica, path.display().to_string(), hash.to_vec(), size as i64, reason, now_ms()])?;
+        Ok(self.conn.last_insert_rowid())
     }
 
-    /// Total size of distinct blobs. A shared hash counts once.
+    /// Total size of the archived blobs, counting each hash once.
     pub fn archive_unique_bytes(&self) -> Result<u64> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT hash, size FROM archive)", [], |r| r.get(0))?;
+        let n: i64 = self.conn.query_row("SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT hash, size FROM archive)", [], |r| r.get(0))?;
         Ok(n as u64)
     }
 
-    /// Count the archive index rows.
-    pub fn archive_row_count(&self) -> Result<u64> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM archive", [], |r| r.get(0))?;
-        Ok(n as u64)
+    /// The number of archive rows and the total size of their blobs, for the dashboard.
+    pub fn archive_stats(&self) -> Result<(u64, u64)> {
+        let rows: i64 = self.conn.query_row("SELECT COUNT(*) FROM archive", [], |r| r.get(0))?;
+        Ok((rows as u64, self.archive_unique_bytes()?))
     }
 
-    /// The relation whose archived blobs add up to the most bytes. Eviction starts there.
-    pub fn archive_largest_relation(&self) -> Result<Option<String>> {
-        Ok(self.conn.query_row(
-            "SELECT rel FROM archive GROUP BY rel ORDER BY SUM(size) DESC LIMIT 1", [], |r| r.get(0)).optional()?)
+    /// The relation with the most archived bytes, with row `keep` left out of the count.
+    pub fn archive_largest_relation(&self, keep: i64) -> Result<Option<String>> {
+        Ok(self.conn.prepare_cached("SELECT rel FROM archive WHERE id<>?1 GROUP BY rel ORDER BY SUM(size) DESC LIMIT 1")?.query_row(params![keep], |r| r.get(0)).optional()?)
     }
 
-    /// The oldest archive row for this relation: its row id and content hash.
-    pub fn archive_oldest_row(&self, relation: &str) -> Result<Option<(i64, String)>> {
-        Ok(self.conn.query_row(
-            "SELECT id, hash FROM archive WHERE rel=?1 ORDER BY at ASC, id ASC LIMIT 1",
-            params![relation], |r| Ok((r.get(0)?, r.get(1)?))).optional()?)
+    /// The id and hash of the oldest archive row of a relation, skipping row `keep`.
+    pub fn archive_oldest_row(&self, relation: &str, keep: i64) -> Result<Option<(i64, Hash)>> {
+        let row: Option<(i64, Vec<u8>)> = self.conn.prepare_cached("SELECT id, hash FROM archive WHERE rel=?1 AND id<>?2 ORDER BY at ASC, id ASC LIMIT 1")?
+            .query_row(params![relation, keep], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        Ok(row.map(|(id, h)| (id, h.try_into().unwrap_or([0; 32]))))
     }
 
-    /// Delete this archive index row. We remove the blob file separately, once nothing else still points at it.
+    /// Delete an archive row by id.
     pub fn archive_delete_row(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM archive WHERE id=?1", params![id])?;
+        self.conn.prepare_cached("DELETE FROM archive WHERE id=?1")?.execute(params![id])?;
         Ok(())
     }
 
-    /// Count the archive rows that still point at this hash.
-    pub fn archive_hash_refcount(&self, hex: &str) -> Result<u64> {
-        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM archive WHERE hash=?1", params![hex], |r| r.get(0))?;
+    /// How many archive rows refer to a hash.
+    pub fn archive_refcount(&self, hash: &Hash) -> Result<u64> {
+        let n: i64 = self.conn.prepare_cached("SELECT COUNT(*) FROM archive WHERE hash=?1")?.query_row(params![hash.to_vec()], |r| r.get(0))?;
         Ok(n as u64)
     }
 
-    /// Archived versions for this relation, newest first.
+    /// Archive rows of a relation, newest first.
     pub fn archive_entries(&self, relation: &str) -> Result<Vec<ArchiveEntry>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT ident, ref, path, hash, size, reason, at FROM archive WHERE rel=?1 ORDER BY at DESC, id DESC")?;
+        let mut stmt = self.conn.prepare_cached("SELECT key, replica, path, hash, size, reason, at FROM archive WHERE rel=?1 ORDER BY at DESC, id DESC")?;
         let rows = stmt.query_map(params![relation], |r| Ok(ArchiveEntry {
-            ident: r.get(0)?,
-            ref_id: r.get(1)?,
+            key: Key::parse(&r.get::<_, String>(0)?).to_string(),
+            replica: r.get(1)?,
             path: r.get(2)?,
-            hash: r.get(3)?,
+            hash: r.get::<_, Vec<u8>>(3)?.try_into().unwrap_or([0; 32]),
             size: r.get::<_, i64>(4)? as u64,
             reason: r.get(5)?,
-            at: SystemTime::UNIX_EPOCH + Duration::from_millis(r.get::<_, i64>(6)? as u64),
-        }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    }
-
-    /// Row count and unique-byte total. The status strip uses these.
-    pub fn archive_stats(&self) -> Result<(u64, u64)> {
-        Ok((self.archive_row_count()?, self.archive_unique_bytes()?))
-    }
-
-    /// Intent rows left over after a restart: those operations did not finish.
-    /// The engine logs them and resolves those identifiers from scratch, rather than replaying the old plan.
-    pub fn stale_intents(&self) -> Result<Vec<(String, Identifier, String)>> {
-        let mut stmt = self.conn.prepare("SELECT rel, ident, detail FROM intent")?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.into_iter().map(|(rel, i, d)| (rel, identifier_from_string(&i), d)).collect())
+            at: from_epoch_ms(r.get::<_, i64>(6)?),
+        }))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 }
 
-/// A version we kept. This content (by hash) was at this path, under this relation, until `at`.
-pub struct ArchiveEntry {
-    pub ident: String,
-    pub ref_id: String,
-    pub path: String,
-    pub hash: String,
-    pub size: u64,
-    pub reason: String,
-    pub at: SystemTime,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A test snapshot with each byte of its hash set to `hash`.
+    fn snap(hash: u8) -> Snapshot {
+        Snapshot { mtime: from_epoch_ms(1_700_000_000_000), size: 3, hash: [hash; 32] }
+    }
+
+    #[test]
+    fn records_round_trip_through_each_basis() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&tmp.path().join("state.db")).unwrap();
+        let key = Key::parse("path=f.txt");
+        store.commit_record("r", &key, "a", &Basis::Snapshot(snap(1))).unwrap();
+        store.commit_record("r", &key, "b", &Basis::Tombstone).unwrap();
+        store.commit_record("r", &key, "c", &Basis::None).unwrap();
+        let records = store.records_for("r").unwrap();
+        let row = &records[&key.canonical()];
+        assert_eq!(row["a"], Basis::Snapshot(snap(1)));
+        assert_eq!(row["b"], Basis::Tombstone);
+        assert!(!row.contains_key("c"));
+        assert_eq!(store.replicas_with_records("r").unwrap(), BTreeSet::from(["a".to_string(), "b".to_string()]));
+        store.forget("r", &key).unwrap();
+        assert!(store.records_for("r").unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_fingerprints_replica_paths_and_intents() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(&tmp.path().join("state.db")).unwrap();
+        assert_eq!(store.flag("gate").unwrap(), None);
+        store.set_flag("gate", true).unwrap();
+        assert_eq!(store.flag("gate").unwrap(), Some(true));
+        assert_eq!(store.fingerprint("r").unwrap(), None);
+        store.set_fingerprint("r", "abc").unwrap();
+        assert_eq!(store.fingerprint("r").unwrap().as_deref(), Some("abc"));
+        assert_eq!(store.note_replica("r", "dest", Path::new("/a")).unwrap(), Noted::New);
+        assert_eq!(store.note_replica("r", "dest", Path::new("/a")).unwrap(), Noted::Same);
+        assert_eq!(store.note_replica("r", "dest", Path::new("/b")).unwrap(), Noted::Moved("/a".into()));
+        let key = Key::parse("path=f.txt");
+        store.write_intent("r", &key, "write dest").unwrap();
+        let stale = store.stale_intents().unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!((stale[0].relation.as_str(), stale[0].key.clone(), stale[0].detail.as_str()), ("r", key.clone(), "write dest"));
+        store.clear_intent("r", &key).unwrap();
+        assert!(store.stale_intents().unwrap().is_empty());
+        store.mark_unresolved("r", &key, "dest", "conflict").unwrap();
+        assert_eq!(store.unresolved_for("r").unwrap(), BTreeSet::from([key.canonical()]));
+        store.clear_unresolved("r", &key, "dest").unwrap();
+        assert!(store.unresolved_for("r").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_foreign_schema_version_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO setting VALUES ('schema_version', '1');").unwrap();
+        }
+        let err = match Store::open(&path) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an old schema was accepted"),
+        };
+        assert!(err.contains("schema version 1") && err.contains("version 2"), "{err}");
+    }
 }

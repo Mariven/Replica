@@ -1,40 +1,87 @@
-//! Discover files, decide what to do, and apply the plan.
+//! The engine runs cycles over the configured relations. For each relation it expands the sites into replicas, skips the relation if its roots overlap another's, and finds the keys. For each key it observes the file at each replica, decides what each replica should hold, and applies the plan. A key whose files all match their records is skipped. When the relation is gated, the engine reports the plan and writes nothing.
 //!
-//! We write to a temp file in the same directory, then rename. We write an intent row first and clear it after commit.
+//! A condition that persists across cycles, such as a conflict, is reported when it appears and again when it changes, and stays quiet in between.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::ErrorKind;
+use std::hash::{Hash as _, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use anyhow::{Context as AnyhowContext, Result, bail};
+use anyhow::{Context, Result, bail};
+use globset::GlobMatcher;
 
-use crate::archive::Archive;
-use crate::identifier::{Identifier, Pattern, identifier_to_string};
-use crate::policy::{Decision, Instance, Op, Policy, Slot};
-use crate::label::{Label, Mapping, MappingKind, Ref, Shape};
-use crate::status::{Change, Snapshot, Status, classify};
-use crate::store::Store;
+use crate::action::{Actions, Shell, Trigger};
+use crate::apply::{self, Executor};
+use crate::blobs::Blobs;
+use crate::decide::{Assignment, Op, Situation, Slot, decide, describe_plan};
+use crate::event::{Event, Hook};
+use crate::flow::{Kind, Policy};
+use crate::medium::{EntryKind, Medium};
+use crate::observe::{Basis, Observation, Snapshot, Transition, classify};
+use crate::site::{Key, Replica, Site, discover_keys, display_names};
+use crate::store::{Intent, Noted, RecordMap, Store, to_epoch_ms};
 
-/// The labels, glob, and policy that make up a relation. `gate_default` is whether writes start gated.
+/// Set by a signal handler or a dashboard command. The engine checks it between keys and ends the cycle early when it is set.
+pub static STOP: AtomicBool = AtomicBool::new(false);
+
+// Keys for tracking relation-wide conditions in `outcomes`. They start with a NUL character so they cannot collide with the canonical text of a real key.
+const KEY_EXPAND: &str = "\0expand";
+const KEY_OVERLAP: &str = "\0overlap";
+const KEY_ROOT: &str = "\0root";
+const KEY_WALK: &str = "\0walk";
+const KEY_ERROR: &str = "\0error";
+
+/// A relation from the configuration, in the form the engine runs.
 pub struct Relation {
     pub name: String,
-    pub labels: Vec<Label>,
-    pub pattern: Pattern,
+    pub sites: Vec<Site>,
+    pub identity: BTreeSet<String>,
+    pub fanout: BTreeSet<String>,
     pub policy: Policy,
+    pub ignore: Vec<GlobMatcher>,
+    pub ignore_text: Vec<String>,
     pub sync_times: bool,
-    /// The config asked this relation to start gated. The live flag lives in [`Gates`].
+    /// Whether the relation's gate starts closed.
     pub gate_default: bool,
+    /// Whether the watcher registers the relation's roots.
+    pub watch: bool,
+    pub actions: Actions,
+    /// Transform commands for each edge, keyed by (from site, to site).
+    pub transforms: BTreeMap<(String, String), Shell>,
+    pub log: Option<PathBuf>,
 }
 
-/// While a gate is closed we still observe and plan. File writes and record updates resume when the gate opens.
-/// The config chooses the starting value. The dashboard can change it later. The global gate applies to every relation.
+impl Relation {
+    /// A hash of the settings that affect decisions. If it differs from the stored fingerprint, the engine decides each key again instead of skipping the settled ones, until an ungated cycle stores the new fingerprint.
+    pub fn fingerprint(&self) -> String {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for site in &self.sites {
+            site.name.hash(&mut h);
+            for loc in &site.locations {
+                loc.pattern.text().hash(&mut h);
+                for v in loc.pattern.vars() {
+                    for c in &v.constraints {
+                        c.text().hash(&mut h);
+                    }
+                }
+            }
+        }
+        self.policy.fingerprint_text().hash(&mut h);
+        self.ignore_text.hash(&mut h);
+        for ((a, b), s) in &self.transforms {
+            (a, b, &s.text).hash(&mut h);
+        }
+        format!("{:016x}", h.finish())
+    }
+}
+
+/// The global gate and the per-relation gates, held in memory. While a gate is closed, the engine still finds keys and plans, but it writes nothing to the files or the database.
 #[derive(Default)]
 pub struct Gates {
-    pub global: AtomicBool,
-    pub relations: Mutex<BTreeMap<String, bool>>,
+    global: AtomicBool,
+    relations: Mutex<BTreeMap<String, bool>>,
 }
 
 impl Gates {
@@ -43,601 +90,749 @@ impl Gates {
         self.global.load(Ordering::Relaxed)
     }
 
-    /// This relation's own flag, without looking at the global gate.
+    /// True when the relation's own gate is closed, ignoring the global gate.
     pub fn relation_flag(&self, relation: &str) -> bool {
         *self.relations.lock().unwrap().get(relation).unwrap_or(&false)
     }
 
-    /// This relation's writes are held: either its own flag is set, or the global gate is closed.
+    /// True when the global gate or the relation's gate is closed.
     pub fn is_gated(&self, relation: &str) -> bool {
         self.globally_gated() || self.relation_flag(relation)
     }
 
-    /// Close or open the global gate.
+    /// Opens or closes the global gate in memory only.
     pub fn set_global(&self, gated: bool) {
         self.global.store(gated, Ordering::Relaxed);
     }
 
-    /// Close or open this relation's gate.
+    /// Opens or closes a relation's gate in memory only.
     pub fn set_relation(&self, relation: &str, gated: bool) {
         self.relations.lock().unwrap().insert(relation.into(), gated);
     }
 }
 
-/// After we finish a file we send this to every hook, including the log writers.
-#[derive(Debug)]
-pub enum Event {
-    Resolved { relation: String, identifier: String, ops: usize },
-    Held { relation: String, identifier: String, detail: String },
-    Skipped { relation: String, identifier: String, reason: String },
-    Pending { relation: String, identifier: String, reason: String },
-    Errored { relation: String, identifier: String, error: String },
-    StaleIntent { relation: String, identifier: String, detail: String },
-}
-
-/// A callback we run for every event.
-pub type Hook = Box<dyn Fn(&Event) + Send>;
-
-/// Run a sync cycle against the store and the configured relations.
+/// Runs cycles over the relations, using the database, the blob store, and a medium for file operations.
 pub struct Engine {
     pub store: Store,
+    pub blobs: Blobs,
+    pub medium: Box<dyn Medium>,
     pub relations: Vec<Relation>,
     pub hooks: Vec<Hook>,
-    pub gates: std::sync::Arc<Gates>,
-    pub archive: Option<Archive>,
+    pub gates: Arc<Gates>,
+    /// Paths the daemon itself writes to. No root may contain one of these paths or lie inside one.
+    pub reserved: Vec<PathBuf>,
+    /// The directory actions and transforms run in, which is the state folder.
+    pub workdir: PathBuf,
+    /// A hash of the last reported outcome for each (relation, key). The engine compares new outcomes against it, so a condition that persists is reported only when it appears or changes.
+    outcomes: Mutex<BTreeMap<(String, String), u64>>,
+    /// Relations whose stored fingerprint differs from the configured one. Their keys are decided in full on each cycle until an ungated cycle stores the new fingerprint.
+    stale_policy: Mutex<BTreeSet<String>>,
 }
 
-/// Stop this relation. The other relations in the cycle keep going.
-struct RelationAbort(String);
+/// Counts of the operations applied and the errors in a cycle.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CycleSummary {
+    pub ops: usize,
+    pub errors: usize,
+}
+
+/// The observed state of a key at each replica, used by both the cycle and the report.
+struct Inspection {
+    situation: Situation,
+    /// No replica has the file.
+    all_missing: bool,
+    /// Each replica matches its record, no hold is open on the key, and no full pass was asked for, so the key can be skipped.
+    settled: bool,
+}
+
+/// The keys found for a relation, along with the folders the walk could not read and the recorded keys that the patterns or the ignore list now exclude.
+struct Discovery {
+    keys: BTreeSet<Key>,
+    failures: Vec<String>,
+    dropped: Vec<Key>,
+}
 
 impl Engine {
-    /// Build an engine and set each relation's starting gate from the config.
-    pub fn new(store: Store, relations: Vec<Relation>, hooks: Vec<Hook>) -> Engine {
+    /// Builds an engine. A relation's gate starts closed if its configuration or its persisted flag says so.
+    pub fn new(store: Store, blobs: Blobs, medium: Box<dyn Medium>, relations: Vec<Relation>, hooks: Vec<Hook>, workdir: PathBuf) -> Engine {
         let gates = Gates::default();
+        let mut stale = BTreeSet::new();
         for rel in &relations {
-            if rel.gate_default {
+            let persisted = store.flag(&format!("gate.{}", rel.name)).ok().flatten().unwrap_or(false);
+            if rel.gate_default || persisted {
                 gates.set_relation(&rel.name, true);
             }
+            if store.fingerprint(&rel.name).ok().flatten().as_deref() != Some(rel.fingerprint().as_str()) {
+                stale.insert(rel.name.clone());
+            }
         }
-        Engine { store, relations, hooks, gates: std::sync::Arc::new(gates), archive: None }
+        if store.flag("gate").ok().flatten().unwrap_or(false) {
+            gates.set_global(true);
+        }
+        Engine { store, blobs, medium, relations, hooks, gates: Arc::new(gates), reserved: Vec::new(), workdir, outcomes: Mutex::default(), stale_policy: Mutex::new(stale) }
     }
 
-    /// Run every hook with this event.
-    fn emit(&self, event: Event) {
+    /// Opens or closes the global gate and persists the flag across restarts.
+    pub fn set_global_gate(&self, gated: bool) {
+        self.gates.set_global(gated);
+        let _ = self.store.set_flag("gate", gated);
+    }
+
+    /// Opens or closes a relation's gate and persists the flag across restarts.
+    pub fn set_relation_gate(&self, relation: &str, gated: bool) {
+        self.gates.set_relation(relation, gated);
+        let _ = self.store.set_flag(&format!("gate.{relation}"), gated);
+    }
+
+    /// Passes an event to each hook.
+    pub fn emit(&self, event: Event) {
         for hook in &self.hooks {
             hook(&event);
         }
     }
 
-    /// If the last run left intent rows, it died mid-write. We log them, clear them, and let this cycle resolve those files from scratch.
-    pub fn recover(&self) -> Result<()> {
-        for (relation, ident, detail) in self.store.stale_intents()? {
-            self.emit(Event::StaleIntent { relation: relation.clone(), identifier: identifier_to_string(&ident), detail });
-            self.store.clear_intent(&relation, &ident)?;
-        }
-        Ok(())
+    /// Stores a hash of `value` under (relation, key) and returns true if it differs from the last one stored, or if nothing was stored yet.
+    fn changed(&self, relation: &str, key: &str, value: &str) -> bool {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut h);
+        let digest = h.finish();
+        self.outcomes.lock().unwrap().insert((relation.to_owned(), key.to_owned()), digest) != Some(digest)
     }
 
-    /// Expand every label, fail if any roots overlap, then resolve each relation.
-    pub fn cycle(&self) -> Result<()> {
-        let mut expanded: Vec<(usize, Vec<Ref>)> = Vec::new();
+    /// Clears the stored outcome for (relation, key), so the condition is reported again if it comes back.
+    fn clear_outcome(&self, relation: &str, key: &str) {
+        self.outcomes.lock().unwrap().remove(&(relation.to_owned(), key.to_owned()));
+    }
+
+    /// Reports and removes the intent rows left by a process that died mid-plan.
+    pub fn recover(&self) -> Result<Vec<Intent>> {
+        let stale = self.store.stale_intents()?;
+        for intent in &stale {
+            self.emit(Event::StaleIntent { relation: intent.relation.clone(), key: intent.key.to_string(), detail: intent.detail.clone() });
+            self.store.clear_intent(&intent.relation, &intent.key)?;
+        }
+        self.blobs.clean_staging();
+        Ok(stale)
+    }
+
+    /// Expands a relation's sites into replicas through the engine's medium.
+    pub fn expand(&self, rel: &Relation) -> Result<Vec<Replica>> {
+        expand(rel, self.medium.as_ref())
+    }
+
+    /// Expands each relation, or only the named ones, and returns the successes and the failures separately, by relation index.
+    fn expand_all(&self, only: Option<&BTreeSet<String>>) -> (Vec<(usize, Vec<Replica>)>, Vec<(usize, String)>) {
+        let mut expanded = Vec::new();
+        let mut failed = Vec::new();
         for (i, rel) in self.relations.iter().enumerate() {
-            let refs: Result<Vec<Ref>> = rel.labels.iter().map(|r| r.refs(&list_subdirs)).collect::<Result<Vec<_>>>().map(|v| v.into_iter().flatten().collect());
-            match refs {
-                Ok(refs) => expanded.push((i, refs)),
-                Err(e) => self.emit(Event::Errored { relation: rel.name.clone(), identifier: String::new(), error: e.to_string() }),
-            }
-        }
-
-        validate_no_overlaps(&self.relations, &expanded)?;
-
-        for (i, refs) in &expanded {
-            let rel = &self.relations[*i];
-            if let Err(e) = self.resolve_relation(rel, refs) {
-                self.emit(Event::Errored { relation: rel.name.clone(), identifier: String::new(), error: e.to_string() });
-            }
-        }
-        Ok(())
-    }
-
-    /// Walk each ref for files, and also include every identifier already in the record (so a file deleted everywhere is still seen).
-    /// Fixed refs cannot identify files. Template refs only match paths that fit the template.
-    fn identifiers(&self, rel: &Relation, refs: &[Ref]) -> Result<BTreeSet<Identifier>> {
-        let mut idents: BTreeSet<Identifier> = BTreeSet::new();
-        for rf in refs {
-            if matches!(rf.mapping_kind, MappingKind::Fixed(_)) {
+            if only.is_some_and(|set| !set.contains(&rel.name)) {
                 continue;
             }
-            for found in walk_identifiers(&rf.root)? {
-                let path = found.iter().fold(rf.root.clone(), |p, c| p.join(c));
-                if let Some(ident) = rf.identify(&path) {
-                    if rel.pattern.matches(&ident) {
-                        idents.insert(ident);
+            match self.expand(rel) {
+                Ok(replicas) => expanded.push((i, replicas)),
+                Err(e) => failed.push((i, format!("{e:#}"))),
+            }
+        }
+        (expanded, failed)
+    }
+
+    /// Runs a cycle over all relations, or only over the named ones.
+    pub fn cycle(&self, only: Option<&BTreeSet<String>>) -> Result<CycleSummary> {
+        let started = Instant::now();
+        let mut summary = CycleSummary::default();
+        let (expanded, failed) = self.expand_all(only);
+        for (i, error) in &failed {
+            let rel = &self.relations[*i].name;
+            summary.errors += 1;
+            if self.changed(rel, KEY_EXPAND, error) {
+                self.emit(Event::Errored { relation: rel.clone(), key: String::new(), error: error.clone() });
+            }
+        }
+        for (i, _) in &expanded {
+            self.clear_outcome(&self.relations[*i].name, KEY_EXPAND);
+        }
+        // Overlaps are checked across all relations, even ones outside this cycle, because a fan-out replica in a skipped relation can overlap a root in one that runs.
+        let all = if only.is_some() { self.expand_all(None).0 } else { expanded.clone() };
+        let conflicts = footprint_conflicts(&self.relations, &all, &self.reserved);
+        let skip: BTreeSet<usize> = conflicts.iter().flat_map(|c| c.relations.iter().copied()).collect();
+        for i in &skip {
+            let rel = &self.relations[*i].name;
+            let own: Vec<&str> = conflicts.iter().filter(|c| c.relations.contains(i)).map(|c| c.message.as_str()).collect();
+            if self.changed(rel, KEY_OVERLAP, &own.join("\n")) {
+                for message in own {
+                    self.emit(Event::Errored { relation: rel.clone(), key: String::new(), error: message.to_owned() });
+                }
+            }
+        }
+        for (i, _) in &expanded {
+            if !skip.contains(i) {
+                self.clear_outcome(&self.relations[*i].name, KEY_OVERLAP);
+            }
+        }
+        let mut names = Vec::new();
+        for (i, replicas) in &expanded {
+            if STOP.load(Ordering::Relaxed) {
+                return Ok(summary);
+            }
+            if skip.contains(i) {
+                summary.errors += 1;
+                continue;
+            }
+            let rel = &self.relations[*i];
+            names.push(rel.name.clone());
+            match self.run_relation(rel, replicas) {
+                Ok(s) => {
+                    self.clear_outcome(&rel.name, KEY_ERROR);
+                    summary.ops += s.ops;
+                    summary.errors += s.errors;
+                }
+                Err(e) => {
+                    summary.errors += 1;
+                    let error = format!("{e:#}");
+                    if self.changed(&rel.name, KEY_ERROR, &error) {
+                        self.emit(Event::Errored { relation: rel.name.clone(), key: String::new(), error });
                     }
                 }
             }
         }
-        for ident in self.store.known_identifiers(&rel.name)? {
-            idents.insert(ident);
-        }
-        Ok(idents)
+        self.emit(Event::Cycle { relations: names, ops: summary.ops, errors: summary.errors, millis: started.elapsed().as_millis() });
+        Ok(summary)
     }
 
-    /// If a root has records but the folder is gone, wait: that looks like an unmount, not a mass delete.
-    /// Then resolve each identifier.
-    fn resolve_relation(&self, rel: &Relation, refs: &[Ref]) -> Result<()> {
-        // Records exist but the folder is gone: almost certainly an unmount or rename, not a mass delete. Wait.
-        for rf in refs {
-            if !rf.root.is_dir() && self.store.ref_has_records(&rel.name, &rf.id())? {
-                self.emit(Event::Pending {
-                    relation: rel.name.clone(),
-                    identifier: String::new(),
-                    reason: format!("{} has records but the folder is missing; treating as unavailable, not deleted", rf.root.display()),
-                });
-                return Ok(());
-            }
-        }
-
-        let idents = self.identifiers(rel, refs)?;
-
-        // Fixed maps every identifier to one path, so it is only coherent for single-identifier relations.
-        let has_fixed = refs.iter().any(|s| matches!(s.mapping_kind, MappingKind::Fixed(_)));
-        if has_fixed && idents.len() > 1 {
-            bail!("relation {:?} has a fixed mapping but {} identifiers; fixed requires exactly one", rel.name, idents.len());
-        }
-
-        for ident in idents {
-            match self.resolve(rel, refs, &ident) {
-                Ok(()) => {}
-                Err(e) if e.is::<RelationAbort>() => {
-                    let RelationAbort(reason) = e.downcast::<RelationAbort>().unwrap();
-                    bail!("relation {:?} aborted: {reason}", rel.name);
-                }
-                Err(e) => self.emit(Event::Errored { relation: rel.name.clone(), identifier: identifier_to_string(&ident), error: e.to_string() }),
-            }
-        }
-        Ok(())
-    }
-
-    /// Read every slot, decide, and apply. If the gate is closed we report the plan and leave the files and the record as they are.
-    fn resolve(&self, rel: &Relation, refs: &[Ref], ident: &Identifier) -> Result<()> {
+    /// Records each replica's pattern in the database. If a replica's pattern changed, its records are dropped, unless the relation is gated. Returns true if any replica now starts without records.
+    fn note_replicas(&self, rel: &Relation, replicas: &[Replica]) -> Result<bool> {
         let gated = self.gates.is_gated(&rel.name);
+        let mut fresh = false;
+        for r in replicas {
+            match self.store.note_replica(&rel.name, r.id(), Path::new(r.pattern.text()))? {
+                Noted::Same => {}
+                // A new replica has no records, so keys that are settled among the other replicas must be decided again to fill it.
+                // Under a gate no files are written, so the row is removed and the replica stays new until an ungated cycle fills it.
+                Noted::New => {
+                    fresh = true;
+                    if gated {
+                        self.store.forget_replica(&rel.name, r.id())?;
+                    }
+                }
+                Noted::Moved(previous) => {
+                    self.emit(Event::Relocated { relation: rel.name.clone(), replica: r.id().to_owned(), from: previous.clone(), to: r.pattern.text().to_owned() });
+                    if !gated {
+                        self.store.forget_replica(&rel.name, r.id())?;
+                        fresh = true;
+                    } else {
+                        // Under a gate, the old pattern is written back so the move is reported again when the gate opens.
+                        self.store.note_replica(&rel.name, r.id(), Path::new(&previous))?;
+                    }
+                }
+            }
+        }
+        Ok(fresh)
+    }
 
-        // Recorded-as-absent is not the same as never recorded. Only "never recorded" blocks the early exit below.
-        let mut slots = Vec::new();
+    /// Finds a relation's keys from the files under each replica and the keys in its records. A recorded key that the patterns or the ignore list now exclude is returned as dropped.
+    fn discover(&self, rel: &Relation, replicas: &[Replica], records: &RecordMap) -> Result<Discovery> {
+        let mut keys = BTreeSet::new();
+        let mut failures = Vec::new();
+        for r in replicas {
+            let found = discover_keys(r, &rel.identity, &rel.ignore, self.medium.as_ref())?;
+            failures.extend(found.failures);
+            keys.extend(found.keys);
+        }
+        // A key is kept if each replica can place it at a path that matches its pattern and is not ignored.
+        let admitted = |key: &Key| replicas.iter().all(|r| match r.locate(key) {
+            Ok(path) => r.pattern.matches(&path).is_some() && !r.pattern.tail(&path).is_some_and(|t| rel.ignore.iter().any(|g| g.is_match(&t))),
+            Err(_) => false,
+        });
+        keys.retain(|k| admitted(k));
+        let mut dropped = Vec::new();
+        for text in records.keys() {
+            let key = Key::parse(text);
+            if admitted(&key) {
+                keys.insert(key);
+            } else {
+                dropped.push(key);
+            }
+        }
+        Ok(Discovery { keys, failures, dropped })
+    }
+
+    /// A message about the first replica whose root folder is missing although it has recorded files. Its volume may be unmounted, so the daemon skips the relation instead of treating the files as deleted.
+    fn unavailable_root(&self, replicas: &[Replica], records: &RecordMap) -> Option<String> {
+        replicas.iter().find(|r| {
+            !self.medium.is_dir(r.root()) && records.values().any(|by| matches!(by.get(r.id()), Some(Basis::Snapshot(_))))
+        }).map(|r| format!("{} has records but the folder is missing; treating it as unavailable, not deleted", r.root().display()))
+    }
+
+    /// Observes a key at each replica and compares each file with its record.
+    fn inspect(&self, replicas: &[Replica], key: &Key, records: &RecordMap, unresolved: &BTreeSet<String>, full: bool) -> Result<Inspection> {
+        let text = key.canonical();
+        let by_replica = records.get(&text);
+        let mut slots = Vec::with_capacity(replicas.len());
         let mut all_recorded = true;
-        for rf in refs {
-            let row = self.store.record(&rel.name, ident, &rf.id())?;
-            all_recorded &= row.is_some();
-            let record = row.flatten();
-            let status = read_status(&rf.locate(ident), record.as_ref());
-            slots.push((rf, Slot { ref_id: rf.id(), label: rf.label.clone(), record, status }));
+        for r in replicas {
+            let basis = by_replica.and_then(|m| m.get(r.id())).cloned().unwrap_or(Basis::None);
+            let path = r.locate(key)?;
+            let observation = observe(self.medium.as_ref(), &path, basis.snapshot());
+            // A replica with no file and no record has nothing to decide. A file without a record is new, so the key has to be decided.
+            all_recorded &= basis.is_recorded() || observation == Observation::Missing;
+            slots.push(Slot { id: r.id().to_owned(), site: r.site.clone(), path, basis, observation });
         }
+        let all_missing = slots.iter().all(|s| s.observation == Observation::Missing);
+        let settled = !full && all_recorded && slots.iter().all(|s| s.transition() == Transition::Unchanged) && !unresolved.contains(&text);
+        Ok(Inspection { situation: Situation { slots }, all_missing, settled })
+    }
 
-        // Missing everywhere: drop the rows and move on.
-        // Forgetting writes the record, so a closed gate skips that too.
-        if slots.iter().all(|(_, s)| s.status == Status::Missing) {
+    /// Runs a relation's part of the cycle. It records the replicas, returns early if a root is unavailable, finds the keys, and then decides and applies each key.
+    fn run_relation(&self, rel: &Relation, replicas: &[Replica]) -> Result<CycleSummary> {
+        let mut summary = CycleSummary::default();
+        let fresh = self.note_replicas(rel, replicas)?;
+        let records = self.store.records_for(&rel.name)?;
+        if let Some(reason) = self.unavailable_root(replicas, &records) {
+            if self.changed(&rel.name, KEY_ROOT, &reason) {
+                self.emit(Event::Pending { relation: rel.name.clone(), reason });
+            }
+            return Ok(summary);
+        }
+        self.clear_outcome(&rel.name, KEY_ROOT);
+        let found = self.discover(rel, replicas, &records)?;
+        if self.changed(&rel.name, KEY_WALK, &found.failures.join("\n")) {
+            for f in &found.failures {
+                self.emit(Event::Warned { relation: rel.name.clone(), key: String::new(), detail: f.clone() });
+            }
+        }
+        let gated = self.gates.is_gated(&rel.name);
+        if !gated {
+            for key in &found.dropped {
+                self.store.forget(&rel.name, key).with_context(|| format!("forgetting {key} after it left the relation"))?;
+            }
+        }
+        let stale = self.stale_policy.lock().unwrap().contains(&rel.name);
+        let full = stale || fresh;
+        let unresolved = self.store.unresolved_for(&rel.name)?;
+        let names = display_names(replicas);
+        let name_of: BTreeMap<&str, &str> = replicas.iter().zip(&names).map(|(r, n)| (r.id(), n.as_str())).collect();
+        let mut changed_any = false;
+        for key in &found.keys {
+            if STOP.load(Ordering::Relaxed) {
+                return Ok(summary);
+            }
+            match self.resolve_key(rel, replicas, key, &records, &unresolved, &name_of, full, gated) {
+                Ok(ops) => {
+                    summary.ops += ops;
+                    changed_any |= ops > 0;
+                }
+                Err(e) => {
+                    summary.errors += 1;
+                    let error = format!("{e:#}");
+                    let text = key.to_string();
+                    if self.changed(&rel.name, &key.canonical(), &format!("error {error}")) {
+                        self.emit(Event::Errored { relation: rel.name.clone(), key: text.clone(), error: error.clone() });
+                        self.fire(rel, Trigger::Error, &[("key", text.as_str()), ("error", error.as_str())]);
+                    }
+                }
+            }
+        }
+        if stale && !gated {
+            self.store.set_fingerprint(&rel.name, &rel.fingerprint())?;
+            self.stale_policy.lock().unwrap().remove(&rel.name);
+        }
+        if changed_any {
+            self.fire(rel, Trigger::Changed, &[("ops", &summary.ops.to_string())]);
+        }
+        Ok(summary)
+    }
+
+    /// Runs the relation's action for a trigger, if it has one, with `relation` added to the variables.
+    fn fire(&self, rel: &Relation, trigger: Trigger, vars: &[(&str, &str)]) {
+        if rel.actions.is_empty() {
+            return;
+        }
+        let mut map: BTreeMap<String, String> = vars.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        map.insert("relation".into(), rel.name.clone());
+        if let Some(event) = rel.actions.fire(trigger, &rel.name, &map, &self.workdir) {
+            self.emit(event);
+        }
+    }
+
+    /// Decides a key and applies the plan, or only reports it if the relation is gated. Returns the number of operations applied.
+    fn resolve_key(&self, rel: &Relation, replicas: &[Replica], key: &Key, records: &RecordMap, unresolved: &BTreeSet<String>, names: &BTreeMap<&str, &str>, full: bool, gated: bool) -> Result<usize> {
+        let text = key.to_string();
+        let canonical = key.canonical();
+        let insp = self.inspect(replicas, key, records, unresolved, full)?;
+        if insp.all_missing {
             if !gated {
-                self.store.forget(&rel.name, ident)?;
+                self.store.forget(&rel.name, key)?;
             }
-            return Ok(());
+            self.clear_outcome(&rel.name, &canonical);
+            return Ok(0);
         }
-
-        // Everything matches the record: nothing to do.
-        // A brand-new scan root has no record yet, so it still goes through decide (policy may want to create files there).
-        if all_recorded && slots.iter().all(|(_, s)| s.change() == Change::Unchanged) {
-            return Ok(());
+        if insp.settled {
+            self.clear_outcome(&rel.name, &canonical);
+            return Ok(0);
         }
-
-        let instance = Instance { identifier: ident.clone(), slots: slots.iter().map(|(_, s)| s.clone()).collect() };
-        let ident_str = identifier_to_string(ident);
-        match rel.policy.decide(&instance) {
-            Decision::Plan(ops) if gated => {
-                // Gate closed: say what we would do, but do not write files or the record, so the same plan comes back next cycle.
-                if !ops.is_empty() {
-                    let detail: Vec<String> = ops.iter().map(|op| match op {
-                        Op::Copy { from, to } => format!("copy {from} -> {to}"),
-                        Op::Delete { at } => format!("delete {at}"),
-                    }).collect();
-                    self.emit(Event::Held { relation: rel.name.clone(), identifier: ident_str, detail: detail.join("; ") });
-                }
-            }
-            Decision::Plan(ops) => {
-                let n = ops.len();
-                self.apply(rel, &slots, ident, ops)?;
-                self.emit(Event::Resolved { relation: rel.name.clone(), identifier: ident_str, ops: n });
-            }
-            Decision::Skip(reason) => {
-                self.emit(Event::Skipped { relation: rel.name.clone(), identifier: ident_str, reason });
-            }
-            Decision::NoDecision => {
-                self.emit(Event::Skipped { relation: rel.name.clone(), identifier: ident_str, reason: "no decision".into() });
-            }
-            Decision::Pending(reason) => {
-                self.emit(Event::Pending { relation: rel.name.clone(), identifier: ident_str, reason });
-            }
-            Decision::Abort(reason) => return Err(anyhow::Error::new(RelationAbort(reason))),
-        }
-        Ok(())
-    }
-
-    /// Write the intent, apply the copies and deletes (temp file + rename), update the record, then clear the intent.
-    /// If we crash, the leftover intent is the evidence.
-    fn apply(&self, rel: &Relation, slots: &[(&Ref, Slot)], ident: &Identifier, ops: Vec<Op>) -> Result<()> {
-        let find = |id: &str| slots.iter().find(|(s, _)| s.id() == id).map(|(s, _)| *s)
-            .ok_or_else(|| anyhow::anyhow!("plan references unknown rf {id:?}"));
-
-        if !ops.is_empty() {
-            let detail: Vec<String> = ops.iter().map(|op| match op {
-                Op::Copy { from, to } => format!("copy {from} -> {to}"),
-                Op::Delete { at } => format!("delete {at}"),
+        let assignment = decide(&rel.policy, &insp.situation);
+        let ops = assignment.ops(&insp.situation);
+        let held_text = |a: &Assignment| a.held.iter().map(|(id, reason)| format!("{}: {reason}", names.get(id.as_str()).unwrap_or(&id.as_str()))).collect::<Vec<_>>();
+        if gated {
+            // The held plan is reported again only if the plan or the observed content changes.
+            let plan = describe_plan(names, &ops);
+            let reasons = held_text(&assignment);
+            let content: Vec<String> = insp.situation.slots.iter().map(|s| match &s.observation {
+                Observation::Present(sn) => crate::observe::short_hash(&sn.hash),
+                other => format!("{other:?}"),
             }).collect();
-            self.store.write_intent(&rel.name, ident, &detail.join("; "))?;
-        }
-
-        // Before a create or delete, drop a marker next to the file. Remove it after commit.
-        // A leftover marker means the operation did not finish.
-        // Only creates and deletes: they are rare and hard to undo. Marking every edit would teach people to ignore the markers.
-        let mut markers: Vec<PathBuf> = Vec::new();
-        for op in &ops {
-            let (word, target_id) = match op {
-                Op::Copy { to, .. } => {
-                    let creating = slots.iter().any(|(rf, s)| rf.id() == *to && s.status == Status::Missing);
-                    if !creating {
-                        continue;
-                    }
-                    ("create", to)
+            if self.changed(&rel.name, &canonical, &format!("held {plan}\n{}\n{}", reasons.join("\n"), content.join(" "))) {
+                if !ops.is_empty() {
+                    self.emit(Event::Held { relation: rel.name.clone(), key: text.clone(), detail: plan.clone() });
+                    self.fire(rel, Trigger::Held, &[("key", text.as_str()), ("plan", plan.as_str())]);
                 }
-                Op::Delete { at } => ("delete", at),
-            };
-            let target = find(target_id)?.locate(ident);
-            markers.push(write_marker(&target, &rel.name, ident, target_id, word)?);
-        }
-
-        // Start from the status we just observed; update as each op lands.
-        let mut outcomes: Vec<(String, Option<Snapshot>)> = slots.iter().map(|(rf, s)| {
-            let snap = match &s.status {
-                Status::Present(snap) => Some(snap.clone()),
-                _ => None,
-            };
-            (rf.id(), snap)
-        }).collect();
-
-        // Archive the current bytes before we overwrite or delete them.
-        // If the archive write fails, abort: we would otherwise lose the only copy.
-        let preserve = |target_id: &str, path: &Path, reason: &str| -> Result<()> {
-            let Some(arch) = &self.archive else { return Ok(()) };
-            match fs::read(path) {
-                Ok(bytes) => arch.preserve(&self.store, &rel.name, ident, target_id, path, &bytes, reason),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            }
-        };
-
-        for op in &ops {
-            match op {
-                Op::Copy { from, to } => {
-                    let donor = find(from)?;
-                    let dest = find(to)?;
-                    let bytes = fs::read(donor.locate(ident))?;
-                    let dest_path = dest.locate(ident);
-                    let donor_snap = slots.iter().find(|(s, _)| s.id() == *from)
-                        .and_then(|(_, s)| match &s.status { Status::Present(sn) => Some(sn.clone()), _ => None })
-                        .ok_or_else(|| anyhow::anyhow!("donor {from:?} has no present snapshot"))?;
-                    let overwriting = slots.iter().any(|(rf, s)| rf.id() == *to
-                        && matches!(&s.status, Status::Present(sn) if sn.hash != donor_snap.hash));
-                    if overwriting {
-                        preserve(to, &dest_path, "overwritten")?;
-                    }
-                    let mtime = rel.sync_times.then_some(donor_snap.mtime);
-                    let written = write_atomic(&dest_path, &bytes, mtime)?;
-                    let snap = Snapshot { mtime: written, size: bytes.len() as u64, hash: donor_snap.hash };
-                    if let Some(o) = outcomes.iter_mut().find(|(id, _)| id == to) {
-                        o.1 = Some(snap);
-                    }
-                }
-                Op::Delete { at } => {
-                    let rf = find(at)?;
-                    let path = rf.locate(ident);
-                    preserve(at, &path, "deleted")?;
-                    match fs::remove_file(&path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    if let Some(o) = outcomes.iter_mut().find(|(id, _)| id == at) {
-                        o.1 = None;
-                    }
+                for reason in reasons {
+                    self.emit(Event::Skipped { relation: rel.name.clone(), key: text.clone(), reason });
                 }
             }
+            return Ok(0);
         }
-
-        for (ref_id, snap) in &outcomes {
-            self.store.commit_record(&rel.name, ident, ref_id, snap.as_ref())?;
+        let n = ops.len();
+        let plan = describe_plan(names, &ops);
+        let executor = Executor { store: &self.store, blobs: &self.blobs, medium: self.medium.as_ref() };
+        let ctx = apply::Context { relation: &rel.name, key, replicas, situation: &insp.situation, sync_times: rel.sync_times, transforms: &rel.transforms, workdir: &self.workdir };
+        let applied = executor.apply(&ctx, &assignment)?;
+        for w in applied.warnings {
+            self.emit(Event::Warned { relation: rel.name.clone(), key: text.clone(), detail: w });
         }
-        self.store.clear_intent(&rel.name, ident)?;
-        for marker in markers {
-            let _ = fs::remove_file(marker);
+        let paths: Vec<String> = applied.paths.iter().map(|p| p.display().to_string()).collect();
+        if n > 0 {
+            self.clear_outcome(&rel.name, &canonical);
+            self.emit(Event::Resolved { relation: rel.name.clone(), key: text.clone(), ops: n, detail: plan.clone(), paths: paths.clone() });
+            for (op, path) in applied.ops.iter().zip(&paths) {
+                let (replica, word) = match op {
+                    Op::Write { to, .. } => (to.as_str(), "write"),
+                    Op::Delete { at } => (at.as_str(), "delete"),
+                };
+                let site = replicas.iter().find(|r| r.id() == replica).map(|r| r.site.as_str()).unwrap_or("");
+                self.fire(rel, Trigger::Resolved, &[("key", text.as_str()), ("path", path.as_str()), ("replica", replica), ("site", site), ("op", word), ("plan", plan.as_str())]);
+            }
+        } else if assignment.held.is_empty() {
+            self.clear_outcome(&rel.name, &canonical);
+            self.emit(Event::Resolved { relation: rel.name.clone(), key: text.clone(), ops: 0, detail: "records aligned, no files changed".into(), paths: Vec::new() });
         }
-        Ok(())
+        let reasons = held_text(&assignment);
+        if !reasons.is_empty() && self.changed(&rel.name, &canonical, &format!("skipped\n{}", reasons.join("\n"))) {
+            for reason in &reasons {
+                self.emit(Event::Skipped { relation: rel.name.clone(), key: text.clone(), reason: reason.clone() });
+            }
+            self.fire(rel, Trigger::Conflict, &[("key", text.as_str()), ("reason", reasons.join("; ").as_str())]);
+        }
+        Ok(n)
     }
 
-    /// Walk the filesystem and the last-sync record so the dashboard can show every relation.
-    /// Unchanged files only need a stat. We reuse the recorded hash.
+    /// Builds a report of each relation by inspecting its keys the same way a cycle does, without writing anything.
     pub fn report(&self) -> Report {
+        let (expanded, failed) = self.expand_all(None);
+        let conflicts = footprint_conflicts(&self.relations, &expanded, &self.reserved);
         let mut relations = Vec::new();
-        for rel in &self.relations {
-            match self.report_relation(rel) {
+        for (i, rel) in self.relations.iter().enumerate() {
+            let failed_with = |error: String| RelationReport {
+                name: rel.name.clone(), sites: Vec::new(), replicas: Vec::new(), rows: Vec::new(),
+                gated: self.gates.relation_flag(&rel.name), unavailable: None, warnings: Vec::new(), error: Some(error),
+            };
+            let overlaps: Vec<&str> = conflicts.iter().filter(|c| c.relations.contains(&i)).map(|c| c.message.as_str()).collect();
+            if !overlaps.is_empty() {
+                relations.push(failed_with(overlaps.join("; ")));
+                continue;
+            }
+            let Some((_, replicas)) = expanded.iter().find(|(j, _)| *j == i) else {
+                let error = failed.iter().find(|(j, _)| *j == i).map(|(_, e)| e.clone()).unwrap_or_else(|| "could not expand sites".into());
+                relations.push(failed_with(error));
+                continue;
+            };
+            match self.report_relation(rel, replicas) {
                 Ok(r) => relations.push(r),
-                Err(e) => relations.push(RelationReport {
-                    name: rel.name.clone(),
-                    labels: Vec::new(),
-                    refs: Vec::new(),
-                    rows: Vec::new(),
-                    gated: self.gates.relation_flag(&rel.name),
-                    error: Some(e.to_string()),
-                }),
+                Err(e) => relations.push(failed_with(format!("{e:#}"))),
             }
         }
-        Report { relations }
+        Report { relations, globally_gated: self.gates.globally_gated() }
     }
 
-    /// Build the dashboard view of this relation, including the plan the next open-gate cycle would apply.
-    fn report_relation(&self, rel: &Relation) -> Result<RelationReport> {
-        let labels = rel.labels.iter().map(|l| LabelView {
-            name: l.name.clone(),
-            mapping: match &l.mapping {
-                Mapping::Direct => "direct".into(),
-                Mapping::Fixed(leaf) => format!("fixed({leaf})"),
-            },
-            shape: match &l.shape {
-                Shape::Literal { root } => format!("root {}", root.display()),
-                Shape::Many { roots } => format!("many, {} roots", roots.len()),
-                Shape::Scan { template, hole, dir } => format!("scan {template} per {{{hole}}} under {}", dir.display()),
-                Shape::Template(t) => format!("pattern {}", t.text),
-            },
-        }).collect();
-
-        let expanded: Vec<Ref> = rel.labels.iter().map(|l| l.refs(&list_subdirs)).collect::<Result<Vec<_>>>()?.into_iter().flatten().collect();
-        let refs: Vec<RefView> = expanded.iter().map(|rf| RefView {
-            label: rf.label.clone(),
-            id: rf.id(),
-            root: rf.root.clone(),
-            root_exists: rf.root.is_dir(),
-            pattern: match &rf.mapping_kind {
-                MappingKind::Template(t) => Some(t.text.clone()),
-                _ => None,
-            },
-        }).collect();
-
-        let idents = self.identifiers(rel, &expanded)?;
-
-        let mut rows = Vec::new();
-        for ident in &idents {
-            let mut cells = Vec::new();
-            let mut slots = Vec::new();
-            for rf in &expanded {
-                let record = self.store.record(&rel.name, ident, &rf.id())?.flatten();
-                let status = read_status(&rf.locate(ident), record.as_ref());
-                let change = classify(record.as_ref(), &status);
-                slots.push(Slot { ref_id: rf.id(), label: rf.label.clone(), record, status: status.clone() });
-                cells.push(CellView { status, change });
+    /// Builds the report for a relation: its sites, its replicas, and a row for each key with the plan for the next cycle.
+    fn report_relation(&self, rel: &Relation, replicas: &[Replica]) -> Result<RelationReport> {
+        let sites = rel.sites.iter().map(|s| {
+            let mut notes = Vec::new();
+            if s.locations.len() > 1 {
+                notes.push(format!("{} locations", s.locations.len()));
             }
-            // Same decision the next open-gate cycle will make.
-            let all_recorded = slots.iter().all(|s| s.record.is_some());
-            let settled = all_recorded && cells.iter().all(|c| c.change == Change::Unchanged);
-            let (plan, note) = if settled {
+            let fan: Vec<String> = s.var_names().intersection(&rel.fanout).cloned().collect();
+            if !fan.is_empty() {
+                notes.push(format!("one replica per {}", fan.join(", ")));
+            }
+            SiteView { name: s.name.clone(), notes }
+        }).collect();
+        let names = display_names(replicas);
+        let views: Vec<ReplicaView> = replicas.iter().zip(&names).map(|(r, name)| ReplicaView {
+            site: r.site.clone(), id: r.id().to_owned(), name: name.clone(), root: r.root().to_path_buf(),
+            root_exists: self.medium.is_dir(r.root()), pattern: r.pattern.text().to_owned(),
+        }).collect();
+        let records = self.store.records_for(&rel.name)?;
+        let gated = self.gates.relation_flag(&rel.name);
+        if let Some(reason) = self.unavailable_root(replicas, &records) {
+            return Ok(RelationReport { name: rel.name.clone(), sites, replicas: views, rows: Vec::new(), gated, unavailable: Some(reason), warnings: Vec::new(), error: None });
+        }
+        let found = self.discover(rel, replicas, &records)?;
+        let unresolved = self.store.unresolved_for(&rel.name)?;
+        // Each key is decided in full under the same conditions as in a cycle: the policy changed, or the database has not seen one of the replicas.
+        let mut full = self.stale_policy.lock().unwrap().contains(&rel.name);
+        for r in replicas {
+            full |= !self.store.replica_known(&rel.name, r.id())?;
+        }
+        let name_of: BTreeMap<&str, &str> = replicas.iter().zip(&names).map(|(r, n)| (r.id(), n.as_str())).collect();
+        let mut rows = Vec::new();
+        for key in &found.keys {
+            let insp = self.inspect(replicas, key, &records, &unresolved, full)?;
+            let cells = insp.situation.slots.iter().map(|s| CellView { observation: s.observation.clone(), transition: s.transition() }).collect();
+            let (plan, note) = if insp.settled || insp.all_missing {
                 (Vec::new(), None)
             } else {
-                match rel.policy.decide(&Instance { identifier: ident.clone(), slots }) {
-                    Decision::Plan(ops) => (ops, None),
-                    Decision::Skip(reason) if reason == "no changes" => (Vec::new(), None),
-                    Decision::Skip(reason) | Decision::Pending(reason) | Decision::Abort(reason) => (Vec::new(), Some(reason)),
-                    Decision::NoDecision => (Vec::new(), None),
-                }
+                let assignment = decide(&rel.policy, &insp.situation);
+                let ops = assignment.ops(&insp.situation);
+                let note = (!assignment.held.is_empty()).then(|| {
+                    assignment.held.iter().map(|(id, reason)| format!("{}: {reason}", name_of.get(id.as_str()).unwrap_or(&id.as_str()))).collect::<Vec<_>>().join("; ")
+                });
+                (ops, note)
             };
-            rows.push(RowView { identifier: identifier_to_string(ident), cells, plan, note });
+            let plan_text = describe_plan(&name_of, &plan);
+            rows.push(RowView { key: key.to_string(), cells, plan, plan_text, note });
         }
-
-        Ok(RelationReport {
-            name: rel.name.clone(),
-            labels,
-            refs,
-            rows,
-            gated: self.gates.relation_flag(&rel.name),
-            error: None,
-        })
+        Ok(RelationReport { name: rel.name.clone(), sites, replicas: views, rows, gated, unavailable: None, warnings: found.failures, error: None })
     }
 }
 
-/// The dashboard builds the page from this. Each row is a file. Each cell is a location, in the same order as `refs`.
-pub struct Report {
-    pub relations: Vec<RelationReport>,
+/// Expands a relation's sites into replicas through a medium.
+pub fn expand(rel: &Relation, medium: &dyn Medium) -> Result<Vec<Replica>> {
+    let mut out = Vec::new();
+    for site in &rel.sites {
+        out.extend(site.expand(&rel.identity, medium)?);
+    }
+    Ok(out)
 }
 
-/// The dashboard shows these labels, locations, and file rows for a relation.
+/// Observes the file at a path. If its size and mtime match the record to the millisecond, the recorded hash is reused instead of reading the file.
+pub fn observe(medium: &dyn Medium, path: &Path, record: Option<&Snapshot>) -> Observation {
+    let meta = match medium.stat(path) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Observation::Missing,
+        Err(e) => return Observation::Unreadable(e.to_string()),
+    };
+    if meta.kind != EntryKind::File {
+        return Observation::Unreadable(format!("{} is not a regular file", path.display()));
+    }
+    if let Some(r) = record {
+        if to_epoch_ms(r.mtime) == to_epoch_ms(meta.mtime) && r.size == meta.size {
+            return Observation::Present(Snapshot { mtime: meta.mtime, size: meta.size, hash: r.hash });
+        }
+    }
+    let hashed = medium.open(path).and_then(|mut f| {
+        let mut hasher = blake3::Hasher::new();
+        std::io::copy(&mut f, &mut hasher)?;
+        Ok(*hasher.finalize().as_bytes())
+    });
+    match hashed {
+        Ok(hash) => Observation::Present(Snapshot { mtime: meta.mtime, size: meta.size, hash }),
+        Err(e) => Observation::Unreadable(e.to_string()),
+    }
+}
+
+/// Classifies a slot's transition, for the dashboard.
+pub fn transition_of(basis: &Basis, observation: &Observation) -> Transition {
+    classify(basis, observation)
+}
+
+/// An overlap between two replica footprints, or between a footprint and a reserved path.
+pub struct Conflict {
+    /// The relations involved, as indexes into the engine's relation list.
+    pub relations: Vec<usize>,
+    pub message: String,
+    /// True if the overlap is with a reserved path instead of another replica.
+    pub reserved: bool,
+}
+
+/// Finds each pair of replica footprints where one lies inside the other, and each footprint that overlaps a reserved path.
+pub fn footprint_conflicts(relations: &[Relation], expanded: &[(usize, Vec<Replica>)], reserved: &[PathBuf]) -> Vec<Conflict> {
+    let mut items: Vec<(PathBuf, usize, &Replica)> = expanded.iter().flat_map(|(i, rs)| rs.iter().map(move |r| (r.pattern.footprint(), *i, r))).collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    for (i, (fa, ra, a)) in items.iter().enumerate() {
+        // The list is sorted, so footprints under fa come right after it and the scan can stop at the first one outside it.
+        for (fb, rb, b) in items[i + 1..].iter().take_while(|(fb, _, _)| fb.starts_with(fa)) {
+            out.push(Conflict {
+                relations: if ra == rb { vec![*ra] } else { vec![(*ra).min(*rb), (*ra).max(*rb)] },
+                message: format!("overlapping roots: {} ({}/{}) and {} ({}/{})", fa.display(), relations[*ra].name, a.id(), fb.display(), relations[*rb].name, b.id()),
+                reserved: false,
+            });
+        }
+        for r in reserved {
+            if r.starts_with(fa) || fa.starts_with(r) {
+                out.push(Conflict {
+                    relations: vec![*ra],
+                    message: format!("{} ({}/{}) overlaps {}, which replica itself writes", fa.display(), relations[*ra].name, a.id(), r.display()),
+                    reserved: true,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// A problem found by `check`, with a flag for whether it involves a reserved path.
+pub struct Problem {
+    pub message: String,
+    pub reserved: bool,
+}
+
+/// Expands each relation and lists the expansion failures and overlapping footprints. The check subcommand and the daemon's startup both use it.
+pub fn check(relations: &[Relation], reserved: &[PathBuf], medium: &dyn Medium) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let mut expanded = Vec::new();
+    for (i, rel) in relations.iter().enumerate() {
+        match expand(rel, medium) {
+            Ok(rs) => expanded.push((i, rs)),
+            Err(e) => problems.push(Problem { message: format!("{}: {e:#}", rel.name), reserved: false }),
+        }
+    }
+    problems.extend(footprint_conflicts(relations, &expanded, reserved).into_iter().map(|c| Problem { message: c.message, reserved: c.reserved }));
+    problems
+}
+
+/// The state of each relation, with the global gate.
+pub struct Report {
+    pub relations: Vec<RelationReport>,
+    pub globally_gated: bool,
+}
+
+/// The state of a relation. The variants run from worst to best, so the minimum across relations gives the overall state.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RelationState {
+    Error,
+    /// A root with recorded files is missing, so the relation is skipped until it comes back.
+    Unavailable,
+    /// Some keys await a sync.
+    Awaiting(usize),
+    /// Some keys have plans, but a gate holds them back.
+    Held(usize),
+    /// Part of a tree could not be read.
+    Degraded,
+    /// A configured folder does not exist yet.
+    FolderMissing,
+    InSync,
+}
+
+impl RelationState {
+    /// The state's name in `status.json`.
+    pub fn word(&self) -> &'static str {
+        match self {
+            RelationState::Error => "error",
+            RelationState::Unavailable => "unavailable",
+            RelationState::Awaiting(_) => "awaiting",
+            RelationState::Held(_) => "held",
+            RelationState::Degraded => "degraded",
+            RelationState::FolderMissing => "folder missing",
+            RelationState::InSync => "in sync",
+        }
+    }
+}
+
+/// The report for a relation, as the dashboard shows it.
 pub struct RelationReport {
     pub name: String,
-    pub labels: Vec<LabelView>,
-    pub refs: Vec<RefView>,
+    pub sites: Vec<SiteView>,
+    pub replicas: Vec<ReplicaView>,
     pub rows: Vec<RowView>,
-    /// This relation's own flag. The global gate lives on [`Gates`].
     pub gated: bool,
+    pub unavailable: Option<String>,
+    pub warnings: Vec<String>,
     pub error: Option<String>,
 }
 
-/// The location line prints this name, mapping, and shape.
-pub struct LabelView {
-    pub name: String,
-    pub mapping: String,
-    pub shape: String,
+impl RelationReport {
+    /// Counts the rows awaiting a sync and the rows a gate holds back, in that order. Only rows with a plan can be held. A row with a hold note and no plan counts as awaiting whether the gate is open or closed.
+    pub fn counts(&self, globally_gated: bool) -> (usize, usize) {
+        let gated = globally_gated || self.gated;
+        let planned = self.rows.iter().filter(|r| !r.plan.is_empty()).count();
+        let noted = self.rows.iter().filter(|r| r.plan.is_empty() && r.note.is_some()).count();
+        if gated { (noted, planned) } else { (planned + noted, 0) }
+    }
+
+    /// The relation's overall state, taken from the worst condition that applies.
+    pub fn state(&self, globally_gated: bool) -> RelationState {
+        if self.error.is_some() {
+            return RelationState::Error;
+        }
+        if self.unavailable.is_some() {
+            return RelationState::Unavailable;
+        }
+        let (awaiting, held) = self.counts(globally_gated);
+        if awaiting > 0 {
+            return RelationState::Awaiting(awaiting);
+        }
+        if held > 0 {
+            return RelationState::Held(held);
+        }
+        if !self.warnings.is_empty() {
+            return RelationState::Degraded;
+        }
+        if self.replicas.iter().any(|r| !r.root_exists) {
+            return RelationState::FolderMissing;
+        }
+        RelationState::InSync
+    }
 }
 
-/// Column headers and plan text use this. It has the location's id, its root, and whether the folder exists.
-pub struct RefView {
-    pub label: String,
+/// A site as the dashboard lists it.
+pub struct SiteView {
+    pub name: String,
+    pub notes: Vec<String>,
+}
+
+/// A replica, shown as a column on the dashboard.
+pub struct ReplicaView {
+    pub site: String,
     pub id: String,
+    pub name: String,
     pub root: PathBuf,
     pub root_exists: bool,
-    /// The whole-path pattern, when this is a template ref.
-    pub pattern: Option<String>,
+    pub pattern: String,
 }
 
-/// A file's status at each location, plus the plan for the next cycle (or the reason we have no plan).
+/// A key's row on the dashboard: a cell for each replica, the plan for the next cycle, and a note explaining any hold.
 pub struct RowView {
-    pub identifier: String,
+    pub key: String,
     pub cells: Vec<CellView>,
-    /// The plan the next open-gate cycle would apply. `note` is set instead when the decision is a skip or a conflict.
     pub plan: Vec<Op>,
+    pub plan_text: String,
     pub note: Option<String>,
 }
 
-/// Status of a file at a location, and whether it matches the record.
+impl RowView {
+    /// True if the row has a plan or a hold note.
+    pub fn needs_attention(&self) -> bool {
+        !self.plan.is_empty() || self.note.is_some()
+    }
+}
+
+/// A cell holds the observation at a replica and the transition from its basis.
 pub struct CellView {
-    pub status: Status,
-    pub change: Change,
+    pub observation: Observation,
+    pub transition: Transition,
 }
 
-impl std::fmt::Display for RelationAbort {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "abort: {}", self.0)
-    }
-}
-impl std::fmt::Debug for RelationAbort {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
-    }
-}
-impl std::error::Error for RelationAbort {}
-
-/// Immediate subdirectories of `dir`, sorted. Scan uses this when expanding roots.
-fn list_subdirs(dir: &Path) -> Result<Vec<String>> {
-    let mut entries = Vec::new();
-    for e in fs::read_dir(dir).with_context(|| format!("scanning {}", dir.display()))? {
-        let e = e?;
-        if e.file_type()?.is_dir() {
-            entries.push(e.file_name().to_string_lossy().into_owned());
-        }
-    }
-    entries.sort();
-    Ok(entries)
+/// The kinds of change the flow carries into a site, for the explain command.
+pub fn incoming_kinds(policy: &Policy, site: &str) -> Vec<Kind> {
+    Kind::ALL.into_iter().filter(|k| policy.flow.has_incoming(*k, site)).collect()
 }
 
-/// Stat and hash this path.
-/// If mtime and size still match the record, we reuse the recorded hash (Unison's fastcheck).
-/// A tool that changes bytes without touching mtime or size will slip through.
-fn read_status(path: &Path, record: Option<&Snapshot>) -> Status {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Status::Missing,
-        Err(e) => return Status::Unreadable(e.to_string()),
-    };
-    if !meta.is_file() {
-        return Status::Unreadable(format!("{} is not a regular file", path.display()));
-    }
-    let mtime = match meta.modified() {
-        Ok(t) => t,
-        Err(e) => return Status::Unreadable(e.to_string()),
-    };
-    let size = meta.len();
-    if let Some(r) = record {
-        if r.mtime == mtime && r.size == size {
-            return Status::Present(Snapshot { mtime, size, hash: r.hash });
-        }
-    }
-    match fs::read(path) {
-        Ok(bytes) => Status::Present(Snapshot { mtime, size, hash: *blake3::hash(&bytes).as_bytes() }),
-        Err(e) => Status::Unreadable(e.to_string()),
-    }
-}
-
-/// Write to a temp file in the same directory, then rename over `path`.
-/// The return value is the mtime after the rename.
-fn write_atomic(path: &Path, bytes: &[u8], mtime: Option<std::time::SystemTime>) -> Result<std::time::SystemTime> {
-    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(".{}{TEMP_SUFFIX}", path.file_name().unwrap_or_default().to_string_lossy()));
-    fs::write(&tmp, bytes)?;
-    if let Some(t) = mtime {
-        filetime::set_file_mtime(&tmp, filetime::FileTime::from_system_time(t))?;
-    }
-    fs::rename(&tmp, path)?;
-    Ok(fs::symlink_metadata(path)?.modified()?)
-}
-
-const TEMP_SUFFIX: &str = ".replica-write";
-const MARKER_SUFFIX: &str = ".replica.tmp";
-
-/// Write a small text file next to the create or delete, and remove it after commit.
-/// Plain text on purpose: the reader is someone wondering what happened to their file.
-fn write_marker(target: &Path, relation: &str, ident: &Identifier, ref_id: &str, op: &str) -> Result<PathBuf> {
-    let marker = PathBuf::from(format!("{}{MARKER_SUFFIX}", target.display()));
-    if let Some(parent) = marker.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let started = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    fs::write(&marker, format!(
-        "service:    replica\n\
-         pid:        {}\n\
-         relation:   {relation}\n\
-         identifier: {}\n\
-         ref:        {ref_id}\n\
-         op:         {op}\n\
-         started:    {started}\n\
-         note:       this marker is removed when the operation commits. if you are reading it, the operation is still running or died partway.\n",
-        std::process::id(),
-        identifier_to_string(ident),
-    ))?;
-    Ok(marker)
-}
-
-/// Relative paths of every regular file under `root`.
-/// A missing root counts as empty (the ref has nothing yet).
-/// We skip symlinks, leftover `.replica-write` files, and leftover `.replica.tmp` files.
-fn walk_identifiers(root: &Path) -> Result<Vec<Identifier>> {
-    let mut idents = Vec::new();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(rel) = stack.pop() {
-        let dir = root.join(&rel);
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == ErrorKind::NotFound && rel.as_os_str().is_empty() => return Ok(idents),
-            Err(e) => return Err(e).with_context(|| format!("walking {}", dir.display())),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            let child = rel.join(entry.file_name());
-            if ty.is_dir() {
-                stack.push(child);
-            } else if ty.is_file() && {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                !name.ends_with(TEMP_SUFFIX) && !name.ends_with(MARKER_SUFFIX)
-            } {
-                idents.push(child.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect());
-            }
-        }
-    }
-    Ok(idents)
-}
-
-/// Fail if two refs share a root or nest inside each other. Otherwise a relation can write into another's files.
-fn validate_no_overlaps(relations: &[Relation], expanded: &[(usize, Vec<Ref>)]) -> Result<()> {
-    let mut roots: Vec<(&str, &Ref)> = Vec::new();
-    for (i, refs) in expanded {
-        for rf in refs {
-            roots.push((&relations[*i].name, rf));
-        }
-    }
-    for (i, (ra, a)) in roots.iter().enumerate() {
-        for (rb, b) in roots.iter().skip(i + 1) {
-            if a.root.starts_with(&b.root) || b.root.starts_with(&a.root) {
-                bail!(
-                    "overlapping roots: {} ({ra}/{}) and {} ({rb}/{})",
-                    a.root.display(), a.id(), b.root.display(), b.id()
-                );
-            }
-        }
+/// Fails if the configuration defines no relations.
+pub fn ensure_relations(relations: &[Relation]) -> Result<()> {
+    if relations.is_empty() {
+        bail!("the configuration defines no relations");
     }
     Ok(())
 }

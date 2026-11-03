@@ -1,0 +1,48 @@
+# The live configuration in the 2.x format. It has its own state folder and dashboard port, so it can run beside the 1.x daemon that launchd runs from config.yaml. To switch over, point the LaunchAgent at this file.
+
+state: ~/scripts/replica/live2
+interval: 1m
+watch: true
+gate: true
+ignore: ["**/.DS_Store", ".DS_Store"]
+dashboard:
+    port: 18517
+    recent_events: 200
+
+profiles:
+    _:
+        flow: "source <-> dest [edit create]"
+        log: "${state}/logs/${relation}.log"
+
+relations:
+    espanso-base:
+        sites:
+            source: ~/scripts/espanso/base.yml
+            dest: ~/Library/Application Support/espanso/match/base.yml
+
+    hermes-soul:
+        sites:
+            source: ~/.hermes/SOUL.md
+            dest: ~/scripts/hermes/SOUL.md
+
+    canvas-chat:
+        sites:
+            source: ~/Library/CloudStorage/Dropbox/Obsidian/.obsidian/plugins/canvas-chat/canvas-chat.js
+            dest: ~/scripts/canvas-chat/canvas-chat.js
+
+    cursor-rules:
+        sites:
+            source: ~/scripts/styles/
+            dest:
+                cohomology: ~/Library/CloudStorage/Dropbox/n.cohomology.group/.cursor/rules/
+                actors-cursor: ~/scripts/actors/.cursor/rules/
+                actors-docs: ~/scripts/actors/docs/style/
+                rewrite: ~/scripts/rewrite/styles/
+                instinct: ~/scripts/instinct/docs/
+        where: { path: "*.mdc" }
+        flow: "source <-> dest [edit create]; source -> dest [delete]"
+
+    chat-models:
+        sites:
+            source: ~/scripts/chat/models.json
+            dest: ~/Library/CloudStorage/Dropbox/n.cohomology.group/js/models.json

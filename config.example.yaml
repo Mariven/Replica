@@ -1,51 +1,87 @@
-# Copy to config.yaml and adjust. All fields are shown; commented ones are defaults.
+# Copy this file to config.yaml and change the paths. `replica check --config config.yaml` validates it, and `replica explain --config config.yaml` shows how each relation resolves.
+# Paths must be absolute or start with ~, because launchd runs the daemon from /.
 
-state_db: "~/scripts/replica/live/state.db"
-interval: "1m"
+state: ~/scripts/replica/live  # The database, the archive, and the logs live here.
+interval: 1m  # Time between full scans.
+watch: true  # Also sync soon after the filesystem reports a change.
+debounce: 2s  # How long to wait for changes to settle before that sync.
+# gate: false  # Set to true to start with all writes held, then open the gate from the dashboard or with `replica gate open`.
+ignore: ["**/.DS_Store", ".DS_Store"]  # Files left out of all relations, matched against the path below each root.
+archive: { cap: 100MB }  # Past this size, the oldest versions of the largest relation are evicted.
 dashboard:
     port: 18516
     recent_events: 200
-    # refresh: 10           # seconds between dashboard refreshes
+    # refresh: 10  # Seconds between page refreshes.
 
-entries:
-    # Defaults copied into every entry below that does not set the same field itself.
-    # {name} expands to the entry's key; any other {field} expands to that entry's field.
+# Variables are written ${name}. Path variables in plain braces, such as {name}, are part of a pattern and are left alone.
+vars:
+    projects: ~/Desktop/Projects
+
+# A profile is a set of relation fields that relations share by naming it under `profile`. The profile `_` applies to all relations, and a relation's own fields win over its profiles.
+profiles:
     _:
-        content: "bidirectional"
-        log: "~/scripts/replica/live/logs/{name}.log"
+        log: "${state}/logs/${relation}.log"  # ${relation} is the relation's name.
+    two-way:
+        flow: "source <-> dest [edit create]"  # Edits and new files travel both ways, and a file deleted on one side is restored from the other.
+    mirror:
+        flow: "source -> dest [edit create delete]"  # Everything travels from source to dest, and edits made at dest are reverted.
 
-    # Two-way sync of .js files between two folders.
-    # An endpoint given as a bare string is a plain root folder.
+relations:
+    # A trailing slash means the whole tree, so each file under one folder pairs with the file at the same path under the other.
+    # `where` narrows a variable. "*.js" keeps JavaScript files at the top level, and "**/*.js" keeps them at any depth.
     mylibrary:
-        source: "~/Desktop/mylibrary"
-        dest: "~/scripts/desktop-library"
-        pattern: "*.js"
-        # content: "bidirectional"    # or: "mirror(source)" for one-way
-        # conflict: "skip"            # or: "newer", "prefer(source)"
-        # on_new: "restrict"          # or: "replicate" to create missing copies
-        # on_delete: "restore"        # or: "propagate", "skip"
-        # sync_times: true
+        profile: two-way
+        sites:
+            source: ~/Desktop/mylibrary/
+            dest: ~/scripts/desktop-library/
+        where: { path: "*.js" }
+        # Brackets list what an edge carries: edit, create, delete, or all. This flow replaces the one from the profile.
+        flow: "source <-> dest [edit create]; source -> dest [delete]"  # Deleting a file at source deletes it at dest, but a file deleted at dest comes back from source.
+        resolve: "source mtime dest"  # When both sides changed, the newer file wins. With `source > dest`, source wins outright.
+        # sync_times: true  # Copy modification times along with the content.
+        # gate: false  # Start with this relation's writes held.
+        # watch: true
 
-    # One file kept in step with a copy that has a different name.
+    # Two plain paths relate two files, whatever their names.
     nginx-default:
-        source: "/etc/nginx/conf.d"
-        dest: { root: "~/Desktop", rename: "nginx-conf.txt" }
+        profile: two-way
+        sites:
+            source: /etc/nginx/conf.d/default.conf
+            dest: ~/Documents/nginx-conf.txt
 
-    # A whole-path template on each side.
-    # Each {hole} matches one path component, and the hole values are the file's shared identity, so the two templates describe the same files under different layouts.
+    # {name} is on both sites, so prose.md pairs with prose/SKILL.md.
     skills:
-        source: "~/scripts/skills/{name}.md"
-        dest: "~/.claude/skills/{name}/SKILL.md"
-        on_new: "replicate"
+        profile: two-way
+        sites:
+            source: ~/scripts/skills/{name}.md
+            dest: ~/.claude/skills/{name}/SKILL.md
 
-    # One file copied into every project folder, rediscovered each cycle.
+    # A site can list several locations, or give them names as here. Each location is a separate replica.
+    cursor-rules:
+        sites:
+            source: ~/scripts/styles/
+            dest:
+                alpha: ${projects}/alpha/.cursor/rules/
+                beta: ${projects}/beta/.cursor/rules/
+        where: { path: "*.mdc" }
+        flow: "source <-> dest [edit create]; source -> dest [delete]"
+
+    # {project} appears only on dest and is declared under `fanout`, so dest gets a replica for each folder under Projects.
     style-guide-all:
-        source: "~/scripts/rules"
-        dest:
-            scan:
-                template: "~/Desktop/Projects/{project}/docs/style"
-                hole: "project"
-                dir: "~/Desktop/Projects"
-        pattern: "main_style.md"
-        content: "mirror(source)"
-        on_new: "replicate"
+        profile: mirror
+        sites:
+            source: ~/scripts/rules/main_style.md
+            dest: "${projects}/{project: [a-z]*}/docs/style/main_style.md"  # The constraint skips folders such as .git.
+        fanout: [project]
+
+    # `transform` passes content through a command on its way along an edge. `on` runs a command when something happens in the relation.
+    site-styles:
+        sites:
+            src: ~/scripts/site/styles/{name}.scss
+            out: ~/scripts/site/public/{name}.css
+        flow: "src -> out [edit create delete]"
+        transform:
+            "src -> out": "sassc ${in} ${out}"
+        on:
+            changed: "touch ~/scripts/site/.rebuild"  # After a cycle that changed files in this relation.
+            conflict: "osascript -e 'display notification \"${key}\" with title \"replica conflict in ${relation}\"'"  # When a file is held with a conflict.
